@@ -6,6 +6,7 @@ import os
 import sqlite3
 from functools import lru_cache
 import time
+from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'livekick_secret_key_2026')
@@ -80,16 +81,38 @@ COMPETITIONS = {
 
 FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac19439794667865a917ad93d187c')
 
-# Cache for API responses
-cache = {}
+# Simple in-memory cache with TTL
+class SimpleCache:
+    def __init__(self, ttl_seconds=300):
+        self.cache = {}
+        self.ttl = ttl_seconds
+    
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key, value):
+        self.cache[key] = (value, time.time())
+    
+    def clear(self):
+        self.cache = {}
 
-@lru_cache(maxsize=1)
-def fetch_competitions_cached():
-    """Fetch competitions with caching."""
-    return fetch_competitions()
+# Cache instances with different TTLs
+competition_cache = SimpleCache(ttl_seconds=3600)  # 1 hour for competitions
+matches_cache = SimpleCache(ttl_seconds=60)  # 1 minute for matches
 
 def fetch_competitions():
-    """Fetch competitions from football-data.org."""
+    """Fetch competitions from football-data.org with caching."""
+    cache_key = 'competitions'
+    cached = competition_cache.get(cache_key)
+    if cached:
+        return cached
+    
     url = 'https://api.football-data.org/v4/competitions'
     headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
     
@@ -109,6 +132,8 @@ def fetch_competitions():
                     'fd_id': COMPETITIONS[code]['fd_id'],
                     'espn_slug': COMPETITIONS[code]['espn']
                 }
+        
+        competition_cache.set(cache_key, competitions)
         return competitions
     except Exception as e:
         print(f"Error fetching competitions: {e}")
@@ -210,15 +235,21 @@ def fetch_espn_matches(slug, date=None):
         
         return matches
     except Exception as e:
-        print(f"Error fetching ESPN matches: {e}")
+        print(f"Error fetching ESPN matches for {slug}: {e}")
         return None
 
 def fetch_fd_matches(fd_id, date=None):
-    """Fetch matches from football-data.org API for a specific date."""
+    """Fetch matches from football-data.org API for a specific date with rate limit handling."""
     if date:
         date_str = date
     else:
         date_str = datetime.now().strftime('%Y-%m-%d')
+    
+    # Check cache first
+    cache_key = f"fd_{fd_id}_{date_str}"
+    cached = matches_cache.get(cache_key)
+    if cached:
+        return cached
     
     url = f'https://api.football-data.org/v4/competitions/{fd_id}/matches'
     params = {'dateFrom': date_str, 'dateTo': date_str}
@@ -226,7 +257,17 @@ def fetch_fd_matches(fd_id, date=None):
     
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
+        
+        # Handle rate limiting
+        if response.status_code == 429:
+            print(f"Rate limit hit for FD ID {fd_id}, waiting...")
+            time.sleep(2)  # Wait 2 seconds
+            # Try one more time
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+        else:
+            response.raise_for_status()
+            
         data = response.json()
         
         matches = []
@@ -276,9 +317,11 @@ def fetch_fd_matches(fd_id, date=None):
                 'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}"
             })
         
+        # Cache the result
+        matches_cache.set(cache_key, matches)
         return matches
     except Exception as e:
-        print(f"Error fetching FD matches: {e}")
+        print(f"Error fetching FD matches for ID {fd_id}: {e}")
         return None
 
 def get_matches_for_competition(code, date=None):
@@ -309,7 +352,7 @@ def get_matches_for_competition(code, date=None):
     
     return matches_data, data_source
 
-# HTML Templates
+# HTML Templates (kept the same as before)
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -920,7 +963,7 @@ MATCHES_TEMPLATE = '''
 
 @app.route('/')
 def index():
-    competitions = fetch_competitions_cached()
+    competitions = fetch_competitions()
     today = datetime.now()
     return render_template_string(INDEX_TEMPLATE, competitions=competitions, today=today)
 
@@ -934,7 +977,7 @@ def matches_web(code):
     
     matches_data, data_source = get_matches_for_competition(code)
     
-    competitions = fetch_competitions_cached()
+    competitions = fetch_competitions()
     comp_display = competitions.get(code, {'name': comp_name, 'emblem': None, 'season': None})
     
     today = datetime.now()
@@ -955,7 +998,7 @@ def matches_web(code):
 def api_competitions():
     """API endpoint to get all competitions."""
     try:
-        competitions = fetch_competitions_cached()
+        competitions = fetch_competitions()
         result = []
         for code, comp in competitions.items():
             result.append({
@@ -1001,9 +1044,18 @@ def api_matches_handler():
             
             if matches_data is None:
                 return jsonify({
-                    'success': False,
-                    'error': 'Failed to fetch matches'
-                }), 500
+                    'success': True,
+                    'data': {
+                        'competition': {
+                            'code': code,
+                            'name': COMPETITIONS[code]['name']
+                        },
+                        'date': date or datetime.now().strftime('%Y-%m-%d'),
+                        'source': data_source,
+                        'matches': [],
+                        'count': 0
+                    }
+                })
             
             comp_info = COMPETITIONS[code]
             
