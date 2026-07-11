@@ -1,5 +1,4 @@
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
-from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
 import json
@@ -10,7 +9,14 @@ import time
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'livekick_secret_key_2026')
-CORS(app)  # Enable CORS for Android app
+
+# Simple CORS middleware (no external dependency)
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 # Use persistent disk if available (for Render)
 DATA_DIR = os.environ.get('DATA_DIR', '/opt/render/data')
@@ -303,7 +309,7 @@ def get_matches_for_competition(code, date=None):
     
     return matches_data, data_source
 
-# HTML Templates (keep the same as before)
+# HTML Templates
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -427,9 +433,8 @@ INDEX_TEMPLATE = '''
         <div class="api-info">
             <h3>📱 API Endpoints for LiveKick App</h3>
             <div class="endpoint">GET /api/competitions - List all competitions</div>
-            <div class="endpoint">GET /api/matches/&lt;code&gt; - Get today's matches for a competition</div>
-            <div class="endpoint">GET /api/matches/&lt;code&gt;?date=YYYY-MM-DD - Get matches for specific date</div>
-            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
+            <div class="endpoint">GET /api/matches?code=PL - Get matches for a competition</div>
+            <div class="endpoint">GET /api/matches?status=live - Get all live matches</div>
             <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
         </div>
     </div>
@@ -909,7 +914,10 @@ MATCHES_TEMPLATE = '''
 </html>
 '''
 
-# Web Routes (Admin Panel)
+# =============================================
+# WEB ROUTES (Admin Panel)
+# =============================================
+
 @app.route('/')
 def index():
     competitions = fetch_competitions_cached()
@@ -948,7 +956,6 @@ def api_competitions():
     """API endpoint to get all competitions."""
     try:
         competitions = fetch_competitions_cached()
-        # Format for Android app
         result = []
         for code, comp in competitions.items():
             result.append({
@@ -969,48 +976,72 @@ def api_competitions():
             'error': str(e)
         }), 500
 
-@app.route('/api/matches/<code>', methods=['GET'])
-def api_matches_by_code(code):
-    """API endpoint to get matches for a competition.
-    
-    Query params:
-    - date: YYYY-MM-DD (optional, defaults to today)
-    """
+@app.route('/api/matches', methods=['GET'])
+def api_matches_handler():
+    """Handle all /api/matches requests from Android app."""
     try:
-        code = code.upper()
-        if code not in COMPETITIONS:
-            return jsonify({
-                'success': False,
-                'error': 'Competition not found'
-            }), 404
-        
-        # Get date from query params
+        status = request.args.get('status')
+        code = request.args.get('code')
         date = request.args.get('date')
         
-        # Get matches
-        matches_data, data_source = get_matches_for_competition(code, date)
+        # If status=live, return live matches
+        if status == 'live':
+            return api_matches_live()
         
-        if matches_data is None:
+        # If code is provided, return matches for that competition
+        if code:
+            code = code.upper()
+            if code not in COMPETITIONS:
+                return jsonify({
+                    'success': False,
+                    'error': 'Competition not found'
+                }), 404
+            
+            matches_data, data_source = get_matches_for_competition(code, date)
+            
+            if matches_data is None:
+                return jsonify({
+                    'success': False,
+                    'error': 'Failed to fetch matches'
+                }), 500
+            
+            comp_info = COMPETITIONS[code]
+            
             return jsonify({
-                'success': False,
-                'error': 'Failed to fetch matches'
-            }), 500
+                'success': True,
+                'data': {
+                    'competition': {
+                        'code': code,
+                        'name': comp_info['name'],
+                        'fd_id': comp_info['fd_id'],
+                        'espn_slug': comp_info['espn']
+                    },
+                    'date': date or datetime.now().strftime('%Y-%m-%d'),
+                    'source': data_source,
+                    'matches': matches_data,
+                    'count': len(matches_data)
+                }
+            })
         
-        comp_info = COMPETITIONS[code]
+        # Default: return all matches grouped by competition
+        all_matches = {}
+        total_count = 0
+        for code, comp_info in COMPETITIONS.items():
+            matches_data, _ = get_matches_for_competition(code, date)
+            if matches_data:
+                all_matches[code] = {
+                    'competition': comp_info['name'],
+                    'matches': matches_data,
+                    'count': len(matches_data)
+                }
+                total_count += len(matches_data)
         
         return jsonify({
             'success': True,
             'data': {
-                'competition': {
-                    'code': code,
-                    'name': comp_info['name'],
-                    'fd_id': comp_info['fd_id'],
-                    'espn_slug': comp_info['espn']
-                },
-                'date': date or datetime.now().strftime('%Y-%m-%d'),
-                'source': data_source,
-                'matches': matches_data,
-                'count': len(matches_data)
+                'matches': all_matches,
+                'total_count': total_count,
+                'date': date or datetime.now().strftime('%Y-%m-%d')
             }
         })
     except Exception as e:
@@ -1021,7 +1052,7 @@ def api_matches_by_code(code):
 
 @app.route('/api/matches/live', methods=['GET'])
 def api_matches_live():
-    """API endpoint to get all currently live matches across all competitions."""
+    """API endpoint to get all currently live matches."""
     try:
         live_matches = []
         
@@ -1029,7 +1060,6 @@ def api_matches_live():
             matches_data, _ = get_matches_for_competition(code)
             
             if matches_data:
-                # Filter to only live matches
                 for match in matches_data:
                     if match.get('status') == 'LIVE':
                         match['competition_code'] = code
@@ -1183,8 +1213,27 @@ def health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0'
+        'version': '1.0.0',
+        'competitions': len(COMPETITIONS)
     })
+
+# =============================================
+# ERROR HANDLERS
+# =============================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
