@@ -34,9 +34,6 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS streams
                  (match_id TEXT, url TEXT, 
                   PRIMARY KEY (match_id, url))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS match_mapping
-                 (source_id TEXT, source TEXT, match_id TEXT, 
-                  PRIMARY KEY (source_id, source))''')
     conn.commit()
     conn.close()
 
@@ -69,54 +66,35 @@ def save_m3u8_links(links):
     conn.commit()
     conn.close()
 
-# Generate consistent match ID
+# Generate a deterministic match ID
 def generate_match_id(source, source_id, home_team, away_team, competition_code, kickoff_time):
     """
-    Generate a consistent, human-readable match ID that the Android app can rely on.
-    Format: {competition_code}_{home_team}_{away_team}_{date}
-    Example: WC_Norway_England_20260711
+    Generate a deterministic match ID that will always be the same for the same match.
+    Uses a hash of match details so the ID is consistent across deployments.
     """
     # Get the date from kickoff time or use today
     if kickoff_time:
         try:
-            # Parse the date from kickoff time
-            dt = datetime.strptime(kickoff_time, '%H:%M UTC')
-            date_str = datetime.now().strftime('%Y%m%d')
+            # Try to extract date from kickoff time
+            if 'UTC' in kickoff_time:
+                # Format is "HH:MM UTC"
+                dt = datetime.now().strftime('%Y%m%d')
+                date_str = dt
+            else:
+                date_str = datetime.now().strftime('%Y%m%d')
         except:
             date_str = datetime.now().strftime('%Y%m%d')
     else:
         date_str = datetime.now().strftime('%Y%m%d')
     
-    # Generate a URL-friendly match ID
-    match_id = f"{competition_code}_{home_team.replace(' ', '_')}_{away_team.replace(' ', '_')}_{date_str}"
+    # Create a unique string from match details (always the same for the same match)
+    unique_string = f"{competition_code}_{home_team}_{away_team}_{date_str}"
     
-    # Keep it short by using a hash of the full string
-    # But first check if we already have a mapping
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    # Generate a short hash (first 8 chars of MD5)
+    hash_id = hashlib.md5(unique_string.encode()).hexdigest()[:8]
     
-    # Check if we have a mapping for this source ID
-    c.execute('SELECT match_id FROM match_mapping WHERE source_id = ? AND source = ?', 
-              (str(source_id), source))
-    result = c.fetchone()
-    conn.close()
-    
-    if result:
-        return result[0]
-    
-    # Generate a shorter unique ID using hash
-    # Format: {first 8 chars of MD5}_{competition_code}_{home_team[:3]}_{away_team[:3]}
-    hash_input = f"{source}_{source_id}_{home_team}_{away_team}_{date_str}"
-    hash_id = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+    # Create a readable match ID
     match_id = f"{hash_id}_{competition_code}_{home_team[:3]}_{away_team[:3]}"
-    
-    # Save mapping
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR REPLACE INTO match_mapping (source_id, source, match_id) VALUES (?, ?, ?)',
-              (str(source_id), source, match_id))
-    conn.commit()
-    conn.close()
     
     return match_id
 
@@ -265,15 +243,21 @@ def fetch_espn_matches(slug, date=None):
             
             source_id = event.get('id', '')
             
+            # Get team names and logos
+            home_team = home.get('team', {}).get('displayName', 'Home')
+            away_team = away.get('team', {}).get('displayName', 'Away')
+            home_crest = home.get('team', {}).get('logo')
+            away_crest = away.get('team', {}).get('logo')
+            
             matches.append({
-                'home_team': home.get('team', {}).get('displayName', 'Home'),
-                'away_team': away.get('team', {}).get('displayName', 'Away'),
-                'home_crest': home.get('team', {}).get('logo'),
-                'away_crest': away.get('team', {}).get('logo'),
+                'home_team': home_team,
+                'away_team': away_team,
+                'home_crest': home_crest,
+                'away_crest': away_crest,
                 'home_score': home_score if home_score is not None else '-',
                 'away_score': away_score if away_score is not None else '-',
                 'status': match_status,
-                'minute': minute,
+                'minute': minute if minute else '0\'',
                 'kickoff': kickoff,
                 'source_id': str(source_id),
                 'source': 'espn'
@@ -388,7 +372,7 @@ def get_matches_for_competition(code, date=None):
     m3u8_links = load_m3u8_links()
     if matches_data:
         for match in matches_data:
-            # Generate a consistent match ID
+            # Generate a deterministic match ID
             match_id = generate_match_id(
                 match.get('source', 'unknown'),
                 match.get('source_id', ''),
@@ -420,7 +404,7 @@ def get_all_matches(date=None):
     
     return all_matches, total_count
 
-# [HTML Templates - keep the same as before]
+# HTML Templates
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -549,6 +533,8 @@ INDEX_TEMPLATE = '''
             <div class="endpoint">GET /api/matches/live - Get all live matches</div>
             <div class="endpoint">GET /api/matches/&lt;match_id&gt; - Get a specific match by ID</div>
             <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
+            <div class="endpoint">POST /api/m3u8/&lt;match_id&gt; - Add a stream</div>
+            <div class="endpoint">DELETE /api/m3u8/&lt;match_id&gt; - Remove a stream</div>
         </div>
     </div>
 </body>
