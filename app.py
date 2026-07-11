@@ -1,14 +1,62 @@
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
+from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
 import json
 import os
+import sqlite3
+from functools import lru_cache
+import time
 
 app = Flask(__name__)
-app.secret_key = 'livekick_secret_key_2026'  # Required for session
+app.secret_key = os.environ.get('SECRET_KEY', 'livekick_secret_key_2026')
+CORS(app)  # Enable CORS for Android app
 
-# File to store m3u8 links
-M3U8_FILE = 'm3u8_links.json'
+# Use persistent disk if available (for Render)
+DATA_DIR = os.environ.get('DATA_DIR', '/opt/render/data')
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, 'streams.db')
+
+# Initialize SQLite database for persistent storage
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS streams
+                 (match_id TEXT, url TEXT, 
+                  PRIMARY KEY (match_id, url))''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Load m3u8 links from SQLite
+def load_m3u8_links():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT match_id, url FROM streams')
+    rows = c.fetchall()
+    conn.close()
+    
+    links = {}
+    for match_id, url in rows:
+        if match_id not in links:
+            links[match_id] = []
+        links[match_id].append(url)
+    return links
+
+# Save m3u8 links to SQLite
+def save_m3u8_links(links):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM streams')
+    for match_id, urls in links.items():
+        for url in urls:
+            c.execute('INSERT INTO streams (match_id, url) VALUES (?, ?)', 
+                     (match_id, url))
+    conn.commit()
+    conn.close()
 
 # Competition mapping
 COMPETITIONS = {
@@ -24,26 +72,238 @@ COMPETITIONS = {
     'CLI': {'fd_id': 2152, 'espn': 'conmebol.libertadores', 'name': 'Copa Libertadores'}
 }
 
-FOOTBALL_DATA_API_KEY = '214ac19439794667865a917ad93d187c'
+FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac19439794667865a917ad93d187c')
 
-# Load m3u8 links from file
-def load_m3u8_links():
-    """Load m3u8 links from JSON file."""
-    if os.path.exists(M3U8_FILE):
-        try:
-            with open(M3U8_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+# Cache for API responses
+cache = {}
 
-# Save m3u8 links to file
-def save_m3u8_links(links):
-    """Save m3u8 links to JSON file."""
-    with open(M3U8_FILE, 'w') as f:
-        json.dump(links, f, indent=2)
+@lru_cache(maxsize=1)
+def fetch_competitions_cached():
+    """Fetch competitions with caching."""
+    return fetch_competitions()
 
-# HTML Templates
+def fetch_competitions():
+    """Fetch competitions from football-data.org."""
+    url = 'https://api.football-data.org/v4/competitions'
+    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        competitions = {}
+        for comp in data.get('competitions', []):
+            code = comp.get('code')
+            if code in COMPETITIONS:
+                competitions[code] = {
+                    'name': COMPETITIONS[code]['name'],
+                    'emblem': comp.get('emblem'),
+                    'season': comp.get('currentSeason', {}).get('year'),
+                    'fd_id': COMPETITIONS[code]['fd_id'],
+                    'espn_slug': COMPETITIONS[code]['espn']
+                }
+        return competitions
+    except Exception as e:
+        print(f"Error fetching competitions: {e}")
+        return {code: {'name': info['name'], 'emblem': None, 'season': None, 
+                      'fd_id': info['fd_id'], 'espn_slug': info['espn']} 
+                for code, info in COMPETITIONS.items()}
+
+def fetch_espn_matches(slug, date=None):
+    """Fetch matches from ESPN API for a specific date."""
+    url = f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard'
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        matches = []
+        events = data.get('events', [])
+        
+        # Use provided date or today
+        if date:
+            try:
+                target_date = datetime.strptime(date, '%Y-%m-%d').date()
+            except:
+                target_date = datetime.now().date()
+        else:
+            target_date = datetime.now().date()
+        
+        for event in events:
+            # Get the event date
+            date_str = event.get('date')
+            if not date_str:
+                continue
+                
+            try:
+                # Parse the date
+                event_date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
+                
+                # Skip if not the target date
+                if event_date != target_date:
+                    continue
+            except:
+                # If we can't parse the date, include it anyway
+                pass
+            
+            status = event.get('status', {})
+            type_val = status.get('type', {})
+            state = type_val.get('state', '')
+            
+            competitions = event.get('competitions', [])
+            if not competitions:
+                continue
+                
+            comp = competitions[0]
+            competitors = comp.get('competitors', [])
+            if len(competitors) < 2:
+                continue
+                
+            home = competitors[0]
+            away = competitors[1]
+            
+            # Determine match status
+            if state == 'in':
+                match_status = 'LIVE'
+            elif state == 'post':
+                match_status = 'FINISHED'
+            else:
+                match_status = 'SCHEDULED'
+            
+            # Get scores
+            home_score = home.get('score')
+            away_score = away.get('score')
+            
+            # Get minute
+            minute = status.get('displayClock')
+            
+            # Get kickoff time
+            kickoff = ''
+            if date_str:
+                try:
+                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    kickoff = dt.strftime('%H:%M UTC')
+                except:
+                    kickoff = date_str
+            
+            match_id = event.get('id', '')
+            
+            matches.append({
+                'home_team': home.get('team', {}).get('displayName', 'Home'),
+                'away_team': away.get('team', {}).get('displayName', 'Away'),
+                'home_crest': home.get('team', {}).get('logo'),
+                'away_crest': away.get('team', {}).get('logo'),
+                'home_score': home_score if home_score is not None else '-',
+                'away_score': away_score if away_score is not None else '-',
+                'status': match_status,
+                'minute': minute,
+                'kickoff': kickoff,
+                'match_id': str(match_id) if match_id else f"espn_{event.get('id', '')}"
+            })
+        
+        return matches
+    except Exception as e:
+        print(f"Error fetching ESPN matches: {e}")
+        return None
+
+def fetch_fd_matches(fd_id, date=None):
+    """Fetch matches from football-data.org API for a specific date."""
+    if date:
+        date_str = date
+    else:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    
+    url = f'https://api.football-data.org/v4/competitions/{fd_id}/matches'
+    params = {'dateFrom': date_str, 'dateTo': date_str}
+    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        matches = []
+        for match in data.get('matches', []):
+            home = match.get('homeTeam', {})
+            away = match.get('awayTeam', {})
+            
+            status = match.get('status', '')
+            if status in ['IN_PLAY', 'PAUSED']:
+                match_status = 'LIVE'
+            elif status == 'FINISHED':
+                match_status = 'FINISHED'
+            else:
+                match_status = 'SCHEDULED'
+            
+            score = match.get('score', {})
+            home_score = score.get('fullTime', {}).get('home')
+            away_score = score.get('fullTime', {}).get('away')
+            
+            if home_score is None:
+                home_score = '-'
+            if away_score is None:
+                away_score = '-'
+            
+            # Get kickoff time
+            kickoff = ''
+            utc_date = match.get('utcDate')
+            if utc_date:
+                try:
+                    dt = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
+                    kickoff = dt.strftime('%H:%M UTC')
+                except:
+                    kickoff = utc_date
+            
+            match_id = match.get('id', '')
+            
+            matches.append({
+                'home_team': home.get('name', 'Home'),
+                'away_team': away.get('name', 'Away'),
+                'home_crest': home.get('crest'),
+                'away_crest': away.get('crest'),
+                'home_score': home_score,
+                'away_score': away_score,
+                'status': match_status,
+                'minute': None,
+                'kickoff': kickoff,
+                'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}"
+            })
+        
+        return matches
+    except Exception as e:
+        print(f"Error fetching FD matches: {e}")
+        return None
+
+def get_matches_for_competition(code, date=None):
+    """Get matches for a competition from ESPN (primary) or FD (fallback)."""
+    if code not in COMPETITIONS:
+        return None, None
+    
+    comp_info = COMPETITIONS[code]
+    espn_slug = comp_info['espn']
+    fd_id = comp_info['fd_id']
+    
+    # Try ESPN first
+    matches_data = fetch_espn_matches(espn_slug, date)
+    data_source = 'ESPN'
+    
+    # If ESPN returns 0 matches or fails, fallback to FD
+    if matches_data is None or len(matches_data) == 0:
+        matches_data = fetch_fd_matches(fd_id, date)
+        data_source = 'football-data.org'
+    
+    # Load m3u8 links and attach to matches
+    m3u8_links = load_m3u8_links()
+    if matches_data:
+        for match in matches_data:
+            match_id = match.get('match_id', '')
+            # Get the list of streams for this match (default to empty list)
+            match['streams'] = m3u8_links.get(match_id, [])
+    
+    return matches_data, data_source
+
+# HTML Templates (keep the same as before)
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -488,7 +748,6 @@ MATCHES_TEMPLATE = '''
                 return;
             }
             
-            // Validate URL format
             if (!url.startsWith('http://') && !url.startsWith('https://')) {
                 alert('URL must start with http:// or https://');
                 return;
@@ -504,7 +763,6 @@ MATCHES_TEMPLATE = '''
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    // Reload the page to show updated list
                     location.reload();
                 } else {
                     alert('Error: ' + data.error);
@@ -531,7 +789,6 @@ MATCHES_TEMPLATE = '''
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    // Reload the page to show updated list
                     location.reload();
                 } else {
                     alert('Error: ' + data.error);
@@ -620,7 +877,6 @@ MATCHES_TEMPLATE = '''
                         {% endif %}
                     </div>
                     
-                    <!-- List of existing streams -->
                     {% if match.streams %}
                     <div class="m3u8-list">
                         {% for stream in match.streams %}
@@ -632,7 +888,6 @@ MATCHES_TEMPLATE = '''
                     </div>
                     {% endif %}
                     
-                    <!-- Add new stream -->
                     <div class="m3u8-input-row">
                         <input id="input-{{ match.match_id }}" type="text" placeholder="Paste stream URL here..." />
                         <button class="btn btn-primary" onclick="addStream('{{ match.match_id }}')">Add Stream</button>
@@ -654,231 +909,10 @@ MATCHES_TEMPLATE = '''
 </html>
 '''
 
-def fetch_competitions():
-    """Fetch competitions from football-data.org and filter to our mapping."""
-    url = 'https://api.football-data.org/v4/competitions'
-    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        competitions = {}
-        for comp in data.get('competitions', []):
-            code = comp.get('code')
-            if code in COMPETITIONS:
-                competitions[code] = {
-                    'name': COMPETITIONS[code]['name'],
-                    'emblem': comp.get('emblem'),
-                    'season': comp.get('currentSeason', {}).get('year'),
-                    'fd_id': COMPETITIONS[code]['fd_id'],
-                    'espn_slug': COMPETITIONS[code]['espn']
-                }
-        return competitions
-    except Exception as e:
-        print(f"Error fetching competitions: {e}")
-        # Return fallback data
-        return {code: {'name': info['name'], 'emblem': None, 'season': None, 'fd_id': info['fd_id'], 'espn_slug': info['espn']} 
-                for code, info in COMPETITIONS.items()}
-
-def fetch_espn_matches(slug, date=None):
-    """Fetch matches from ESPN API for a specific date."""
-    url = f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard'
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        matches = []
-        events = data.get('events', [])
-        
-        # Use provided date or today
-        if date:
-            try:
-                target_date = datetime.strptime(date, '%Y-%m-%d').date()
-            except:
-                target_date = datetime.now().date()
-        else:
-            target_date = datetime.now().date()
-        
-        for event in events:
-            # Get the event date
-            date_str = event.get('date')
-            if not date_str:
-                continue
-                
-            try:
-                # Parse the date
-                event_date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
-                
-                # Skip if not the target date
-                if event_date != target_date:
-                    continue
-            except:
-                # If we can't parse the date, include it anyway
-                pass
-            
-            status = event.get('status', {})
-            type_val = status.get('type', {})
-            state = type_val.get('state', '')
-            
-            competitions = event.get('competitions', [])
-            if not competitions:
-                continue
-                
-            comp = competitions[0]
-            competitors = comp.get('competitors', [])
-            if len(competitors) < 2:
-                continue
-                
-            home = competitors[0]
-            away = competitors[1]
-            
-            # Determine match status
-            if state == 'in':
-                match_status = 'LIVE'
-            elif state == 'post':
-                match_status = 'FINISHED'
-            else:
-                match_status = 'SCHEDULED'
-            
-            # Get scores
-            home_score = home.get('score')
-            away_score = away.get('score')
-            
-            # Get minute
-            minute = status.get('displayClock')
-            
-            # Get kickoff time
-            kickoff = ''
-            if date_str:
-                try:
-                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                    kickoff = dt.strftime('%H:%M UTC')
-                except:
-                    kickoff = date_str
-            
-            match_id = event.get('id', '')
-            
-            matches.append({
-                'home_team': home.get('team', {}).get('displayName', 'Home'),
-                'away_team': away.get('team', {}).get('displayName', 'Away'),
-                'home_crest': home.get('team', {}).get('logo'),
-                'away_crest': away.get('team', {}).get('logo'),
-                'home_score': home_score if home_score is not None else '-',
-                'away_score': away_score if away_score is not None else '-',
-                'status': match_status,
-                'minute': minute,
-                'kickoff': kickoff,
-                'match_id': str(match_id) if match_id else f"espn_{event.get('id', '')}"
-            })
-        
-        return matches
-    except Exception as e:
-        print(f"Error fetching ESPN matches: {e}")
-        return None
-
-def fetch_fd_matches(fd_id, date=None):
-    """Fetch matches from football-data.org API for a specific date."""
-    if date:
-        date_str = date
-    else:
-        date_str = datetime.now().strftime('%Y-%m-%d')
-    
-    url = f'https://api.football-data.org/v4/competitions/{fd_id}/matches'
-    params = {'dateFrom': date_str, 'dateTo': date_str}
-    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        matches = []
-        for match in data.get('matches', []):
-            home = match.get('homeTeam', {})
-            away = match.get('awayTeam', {})
-            
-            status = match.get('status', '')
-            if status in ['IN_PLAY', 'PAUSED']:
-                match_status = 'LIVE'
-            elif status == 'FINISHED':
-                match_status = 'FINISHED'
-            else:
-                match_status = 'SCHEDULED'
-            
-            score = match.get('score', {})
-            home_score = score.get('fullTime', {}).get('home')
-            away_score = score.get('fullTime', {}).get('away')
-            
-            if home_score is None:
-                home_score = '-'
-            if away_score is None:
-                away_score = '-'
-            
-            # Get kickoff time
-            kickoff = ''
-            utc_date = match.get('utcDate')
-            if utc_date:
-                try:
-                    dt = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
-                    kickoff = dt.strftime('%H:%M UTC')
-                except:
-                    kickoff = utc_date
-            
-            match_id = match.get('id', '')
-            
-            matches.append({
-                'home_team': home.get('name', 'Home'),
-                'away_team': away.get('name', 'Away'),
-                'home_crest': home.get('crest'),
-                'away_crest': away.get('crest'),
-                'home_score': home_score,
-                'away_score': away_score,
-                'status': match_status,
-                'minute': None,
-                'kickoff': kickoff,
-                'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}"
-            })
-        
-        return matches
-    except Exception as e:
-        print(f"Error fetching FD matches: {e}")
-        return None
-
-def get_matches_for_competition(code, date=None):
-    """Get matches for a competition from ESPN (primary) or FD (fallback)."""
-    if code not in COMPETITIONS:
-        return None, None
-    
-    comp_info = COMPETITIONS[code]
-    espn_slug = comp_info['espn']
-    fd_id = comp_info['fd_id']
-    
-    # Try ESPN first
-    matches_data = fetch_espn_matches(espn_slug, date)
-    data_source = 'ESPN'
-    
-    # If ESPN returns 0 matches or fails, fallback to FD
-    if matches_data is None or len(matches_data) == 0:
-        matches_data = fetch_fd_matches(fd_id, date)
-        data_source = 'football-data.org'
-    
-    # Load m3u8 links and attach to matches
-    m3u8_links = load_m3u8_links()
-    if matches_data:
-        for match in matches_data:
-            match_id = match.get('match_id', '')
-            # Get the list of streams for this match (default to empty list)
-            match['streams'] = m3u8_links.get(match_id, [])
-    
-    return matches_data, data_source
-
 # Web Routes (Admin Panel)
 @app.route('/')
 def index():
-    competitions = fetch_competitions()
+    competitions = fetch_competitions_cached()
     today = datetime.now()
     return render_template_string(INDEX_TEMPLATE, competitions=competitions, today=today)
 
@@ -890,11 +924,9 @@ def matches_web(code):
     comp_info = COMPETITIONS[code]
     comp_name = comp_info['name']
     
-    # Get matches for today
     matches_data, data_source = get_matches_for_competition(code)
     
-    # Get competition info for display
-    competitions = fetch_competitions()
+    competitions = fetch_competitions_cached()
     comp_display = competitions.get(code, {'name': comp_name, 'emblem': None, 'season': None})
     
     today = datetime.now()
@@ -907,203 +939,253 @@ def matches_web(code):
         today=today
     )
 
-# API Routes for LiveKick Android App
+# =============================================
+# API ROUTES FOR ANDROID APP
+# =============================================
+
 @app.route('/api/competitions', methods=['GET'])
 def api_competitions():
     """API endpoint to get all competitions."""
-    competitions = fetch_competitions()
-    return jsonify({
-        'success': True,
-        'data': competitions
-    })
+    try:
+        competitions = fetch_competitions_cached()
+        # Format for Android app
+        result = []
+        for code, comp in competitions.items():
+            result.append({
+                'code': code,
+                'name': comp['name'],
+                'emblem': comp.get('emblem', ''),
+                'season': comp.get('season', 'Current Season'),
+                'enabled': True
+            })
+        return jsonify({
+            'success': True,
+            'data': result,
+            'count': len(result)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/matches/<code>', methods=['GET'])
-def api_matches(code):
+def api_matches_by_code(code):
     """API endpoint to get matches for a competition.
     
     Query params:
     - date: YYYY-MM-DD (optional, defaults to today)
     """
-    if code not in COMPETITIONS:
+    try:
+        code = code.upper()
+        if code not in COMPETITIONS:
+            return jsonify({
+                'success': False,
+                'error': 'Competition not found'
+            }), 404
+        
+        # Get date from query params
+        date = request.args.get('date')
+        
+        # Get matches
+        matches_data, data_source = get_matches_for_competition(code, date)
+        
+        if matches_data is None:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to fetch matches'
+            }), 500
+        
+        comp_info = COMPETITIONS[code]
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'competition': {
+                    'code': code,
+                    'name': comp_info['name'],
+                    'fd_id': comp_info['fd_id'],
+                    'espn_slug': comp_info['espn']
+                },
+                'date': date or datetime.now().strftime('%Y-%m-%d'),
+                'source': data_source,
+                'matches': matches_data,
+                'count': len(matches_data)
+            }
+        })
+    except Exception as e:
         return jsonify({
             'success': False,
-            'error': 'Competition not found'
-        }), 404
-    
-    # Get date from query params
-    date = request.args.get('date')
-    
-    # Get matches
-    matches_data, data_source = get_matches_for_competition(code, date)
-    
-    if matches_data is None:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to fetch matches'
+            'error': str(e)
         }), 500
-    
-    comp_info = COMPETITIONS[code]
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'competition': {
-                'code': code,
-                'name': comp_info['name'],
-                'fd_id': comp_info['fd_id'],
-                'espn_slug': comp_info['espn']
-            },
-            'date': date or datetime.now().strftime('%Y-%m-%d'),
-            'source': data_source,
-            'matches': matches_data
-        }
-    })
 
 @app.route('/api/matches/live', methods=['GET'])
-def api_live_matches():
+def api_matches_live():
     """API endpoint to get all currently live matches across all competitions."""
-    live_matches = []
-    
-    for code, comp_info in COMPETITIONS.items():
-        matches_data, _ = get_matches_for_competition(code)
+    try:
+        live_matches = []
         
-        if matches_data:
-            # Filter to only live matches
-            for match in matches_data:
-                if match.get('status') == 'LIVE':
-                    match['competition_code'] = code
-                    match['competition_name'] = comp_info['name']
-                    live_matches.append(match)
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'count': len(live_matches),
-            'matches': live_matches
-        }
-    })
+        for code, comp_info in COMPETITIONS.items():
+            matches_data, _ = get_matches_for_competition(code)
+            
+            if matches_data:
+                # Filter to only live matches
+                for match in matches_data:
+                    if match.get('status') == 'LIVE':
+                        match['competition_code'] = code
+                        match['competition_name'] = comp_info['name']
+                        live_matches.append(match)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'count': len(live_matches),
+                'matches': live_matches
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/m3u8/<match_id>', methods=['GET', 'POST', 'DELETE'])
 def api_m3u8(match_id):
     """API endpoint to manage m3u8 links for a match."""
-    m3u8_links = load_m3u8_links()
-    
-    if request.method == 'GET':
-        """Get all m3u8 links for a match."""
-        streams = m3u8_links.get(match_id, [])
-        return jsonify({
-            'success': True,
-            'data': {
-                'match_id': match_id,
-                'streams': streams,
-                'count': len(streams)
-            }
-        })
-    
-    elif request.method == 'POST':
-        """Add a new m3u8 link for a match."""
-        data = request.get_json()
-        if not data or 'url' not in data:
+    try:
+        m3u8_links = load_m3u8_links()
+        
+        if request.method == 'GET':
+            """Get all m3u8 links for a match."""
+            streams = m3u8_links.get(match_id, [])
             return jsonify({
-                'success': False,
-                'error': 'Missing url parameter'
-            }), 400
+                'success': True,
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
+            })
         
-        url = data['url'].strip()
-        if not url:
-            return jsonify({
-                'success': False,
-                'error': 'URL cannot be empty'
-            }), 400
-        
-        # Validate URL format (basic check)
-        if not url.startswith(('http://', 'https://')):
-            return jsonify({
-                'success': False,
-                'error': 'Invalid URL format. Must start with http:// or https://'
-            }), 400
-        
-        # Get existing streams or create new list
-        streams = m3u8_links.get(match_id, [])
-        
-        # Check if URL already exists
-        if url in streams:
-            return jsonify({
-                'success': False,
-                'error': 'This stream URL already exists for this match'
-            }), 400
-        
-        # Add the new URL
-        streams.append(url)
-        m3u8_links[match_id] = streams
-        save_m3u8_links(m3u8_links)
-        
-        return jsonify({
-            'success': True,
-            'message': 'Stream added successfully',
-            'data': {
-                'match_id': match_id,
-                'streams': streams,
-                'count': len(streams)
-            }
-        })
-    
-    elif request.method == 'DELETE':
-        """Remove a specific m3u8 link for a match."""
-        data = request.get_json()
-        if not data or 'url' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing url parameter'
-            }), 400
-        
-        url = data['url'].strip()
-        streams = m3u8_links.get(match_id, [])
-        
-        if url not in streams:
-            return jsonify({
-                'success': False,
-                'error': 'Stream URL not found for this match'
-            }), 404
-        
-        # Remove the URL
-        streams.remove(url)
-        
-        # If no streams left, remove the entry entirely
-        if streams:
+        elif request.method == 'POST':
+            """Add a new m3u8 link for a match."""
+            data = request.get_json()
+            if not data or 'url' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Missing url parameter'
+                }), 400
+            
+            url = data['url'].strip()
+            if not url:
+                return jsonify({
+                    'success': False,
+                    'error': 'URL cannot be empty'
+                }), 400
+            
+            if not url.startswith(('http://', 'https://')):
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid URL format. Must start with http:// or https://'
+                }), 400
+            
+            streams = m3u8_links.get(match_id, [])
+            
+            if url in streams:
+                return jsonify({
+                    'success': False,
+                    'error': 'This stream URL already exists for this match'
+                }), 400
+            
+            streams.append(url)
             m3u8_links[match_id] = streams
-        else:
-            del m3u8_links[match_id]
+            save_m3u8_links(m3u8_links)
+            
+            return jsonify({
+                'success': True,
+                'message': 'Stream added successfully',
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
+            })
         
-        save_m3u8_links(m3u8_links)
-        
+        elif request.method == 'DELETE':
+            """Remove a specific m3u8 link for a match."""
+            data = request.get_json()
+            if not data or 'url' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Missing url parameter'
+                }), 400
+            
+            url = data['url'].strip()
+            streams = m3u8_links.get(match_id, [])
+            
+            if url not in streams:
+                return jsonify({
+                    'success': False,
+                    'error': 'Stream URL not found for this match'
+                }), 404
+            
+            streams.remove(url)
+            
+            if streams:
+                m3u8_links[match_id] = streams
+            else:
+                del m3u8_links[match_id]
+            
+            save_m3u8_links(m3u8_links)
+            
+            return jsonify({
+                'success': True,
+                'message': 'Stream removed successfully',
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
+            })
+    except Exception as e:
         return jsonify({
-            'success': True,
-            'message': 'Stream removed successfully',
-            'data': {
-                'match_id': match_id,
-                'streams': streams,
-                'count': len(streams)
-            }
-        })
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/m3u8/<match_id>/clear', methods=['DELETE'])
 def api_m3u8_clear(match_id):
     """Clear all m3u8 links for a match."""
-    m3u8_links = load_m3u8_links()
-    
-    if match_id in m3u8_links:
-        del m3u8_links[match_id]
-        save_m3u8_links(m3u8_links)
-        return jsonify({
-            'success': True,
-            'message': 'All streams cleared successfully'
-        })
-    else:
+    try:
+        m3u8_links = load_m3u8_links()
+        
+        if match_id in m3u8_links:
+            del m3u8_links[match_id]
+            save_m3u8_links(m3u8_links)
+            return jsonify({
+                'success': True,
+                'message': 'All streams cleared successfully'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'No streams found for this match'
+            }), 404
+    except Exception as e:
         return jsonify({
             'success': False,
-            'error': 'No streams found for this match'
-        }), 404
+            'error': str(e)
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint for Render."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
