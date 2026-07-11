@@ -6,6 +6,7 @@ import os
 import sqlite3
 from functools import lru_cache
 import time
+import hashlib
 from collections import defaultdict
 
 app = Flask(__name__)
@@ -33,6 +34,9 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS streams
                  (match_id TEXT, url TEXT, 
                   PRIMARY KEY (match_id, url))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS match_mapping
+                 (source_id TEXT, source TEXT, match_id TEXT, 
+                  PRIMARY KEY (source_id, source))''')
     conn.commit()
     conn.close()
 
@@ -65,6 +69,57 @@ def save_m3u8_links(links):
     conn.commit()
     conn.close()
 
+# Generate consistent match ID
+def generate_match_id(source, source_id, home_team, away_team, competition_code, kickoff_time):
+    """
+    Generate a consistent, human-readable match ID that the Android app can rely on.
+    Format: {competition_code}_{home_team}_{away_team}_{date}
+    Example: WC_Norway_England_20260711
+    """
+    # Get the date from kickoff time or use today
+    if kickoff_time:
+        try:
+            # Parse the date from kickoff time
+            dt = datetime.strptime(kickoff_time, '%H:%M UTC')
+            date_str = datetime.now().strftime('%Y%m%d')
+        except:
+            date_str = datetime.now().strftime('%Y%m%d')
+    else:
+        date_str = datetime.now().strftime('%Y%m%d')
+    
+    # Generate a URL-friendly match ID
+    match_id = f"{competition_code}_{home_team.replace(' ', '_')}_{away_team.replace(' ', '_')}_{date_str}"
+    
+    # Keep it short by using a hash of the full string
+    # But first check if we already have a mapping
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Check if we have a mapping for this source ID
+    c.execute('SELECT match_id FROM match_mapping WHERE source_id = ? AND source = ?', 
+              (str(source_id), source))
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return result[0]
+    
+    # Generate a shorter unique ID using hash
+    # Format: {first 8 chars of MD5}_{competition_code}_{home_team[:3]}_{away_team[:3]}
+    hash_input = f"{source}_{source_id}_{home_team}_{away_team}_{date_str}"
+    hash_id = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+    match_id = f"{hash_id}_{competition_code}_{home_team[:3]}_{away_team[:3]}"
+    
+    # Save mapping
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO match_mapping (source_id, source, match_id) VALUES (?, ?, ?)',
+              (str(source_id), source, match_id))
+    conn.commit()
+    conn.close()
+    
+    return match_id
+
 # Competition mapping
 COMPETITIONS = {
     'WC': {'fd_id': 2000, 'espn': 'fifa.world', 'name': 'FIFA World Cup'},
@@ -83,7 +138,7 @@ FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac1943979466
 
 # Simple in-memory cache with TTL
 class SimpleCache:
-    def __init__(self, ttl_seconds=300):
+    def __init__(self, ttl_seconds=30):  # 30 seconds for live updates
         self.cache = {}
         self.ttl = ttl_seconds
     
@@ -102,9 +157,9 @@ class SimpleCache:
     def clear(self):
         self.cache = {}
 
-# Cache instances with different TTLs
+# Cache instances
 competition_cache = SimpleCache(ttl_seconds=3600)  # 1 hour for competitions
-matches_cache = SimpleCache(ttl_seconds=60)  # 1 minute for matches
+matches_cache = SimpleCache(ttl_seconds=30)  # 30 seconds for matches
 
 def fetch_competitions():
     """Fetch competitions from football-data.org with caching."""
@@ -162,20 +217,15 @@ def fetch_espn_matches(slug, date=None):
             target_date = datetime.now().date()
         
         for event in events:
-            # Get the event date
             date_str = event.get('date')
             if not date_str:
                 continue
                 
             try:
-                # Parse the date
                 event_date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
-                
-                # Skip if not the target date
                 if event_date != target_date:
                     continue
             except:
-                # If we can't parse the date, include it anyway
                 pass
             
             status = event.get('status', {})
@@ -194,7 +244,6 @@ def fetch_espn_matches(slug, date=None):
             home = competitors[0]
             away = competitors[1]
             
-            # Determine match status
             if state == 'in':
                 match_status = 'LIVE'
             elif state == 'post':
@@ -202,14 +251,10 @@ def fetch_espn_matches(slug, date=None):
             else:
                 match_status = 'SCHEDULED'
             
-            # Get scores
             home_score = home.get('score')
             away_score = away.get('score')
-            
-            # Get minute
             minute = status.get('displayClock')
             
-            # Get kickoff time
             kickoff = ''
             if date_str:
                 try:
@@ -218,7 +263,7 @@ def fetch_espn_matches(slug, date=None):
                 except:
                     kickoff = date_str
             
-            match_id = event.get('id', '')
+            source_id = event.get('id', '')
             
             matches.append({
                 'home_team': home.get('team', {}).get('displayName', 'Home'),
@@ -230,7 +275,8 @@ def fetch_espn_matches(slug, date=None):
                 'status': match_status,
                 'minute': minute,
                 'kickoff': kickoff,
-                'match_id': str(match_id) if match_id else f"espn_{event.get('id', '')}"
+                'source_id': str(source_id),
+                'source': 'espn'
             })
         
         return matches
@@ -239,13 +285,12 @@ def fetch_espn_matches(slug, date=None):
         return None
 
 def fetch_fd_matches(fd_id, date=None):
-    """Fetch matches from football-data.org API for a specific date with rate limit handling."""
+    """Fetch matches from football-data.org API."""
     if date:
         date_str = date
     else:
         date_str = datetime.now().strftime('%Y-%m-%d')
     
-    # Check cache first
     cache_key = f"fd_{fd_id}_{date_str}"
     cached = matches_cache.get(cache_key)
     if cached:
@@ -258,11 +303,9 @@ def fetch_fd_matches(fd_id, date=None):
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         
-        # Handle rate limiting
         if response.status_code == 429:
             print(f"Rate limit hit for FD ID {fd_id}, waiting...")
-            time.sleep(2)  # Wait 2 seconds
-            # Try one more time
+            time.sleep(2)
             response = requests.get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status()
         else:
@@ -292,7 +335,6 @@ def fetch_fd_matches(fd_id, date=None):
             if away_score is None:
                 away_score = '-'
             
-            # Get kickoff time
             kickoff = ''
             utc_date = match.get('utcDate')
             if utc_date:
@@ -302,7 +344,7 @@ def fetch_fd_matches(fd_id, date=None):
                 except:
                     kickoff = utc_date
             
-            match_id = match.get('id', '')
+            source_id = match.get('id', '')
             
             matches.append({
                 'home_team': home.get('name', 'Home'),
@@ -314,10 +356,10 @@ def fetch_fd_matches(fd_id, date=None):
                 'status': match_status,
                 'minute': None,
                 'kickoff': kickoff,
-                'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}"
+                'source_id': str(source_id),
+                'source': 'fd'
             })
         
-        # Cache the result
         matches_cache.set(cache_key, matches)
         return matches
     except Exception as e:
@@ -342,17 +384,43 @@ def get_matches_for_competition(code, date=None):
         matches_data = fetch_fd_matches(fd_id, date)
         data_source = 'football-data.org'
     
-    # Load m3u8 links and attach to matches
+    # Generate consistent match IDs and attach streams
     m3u8_links = load_m3u8_links()
     if matches_data:
         for match in matches_data:
-            match_id = match.get('match_id', '')
-            # Get the list of streams for this match (default to empty list)
+            # Generate a consistent match ID
+            match_id = generate_match_id(
+                match.get('source', 'unknown'),
+                match.get('source_id', ''),
+                match.get('home_team', 'Home'),
+                match.get('away_team', 'Away'),
+                code,
+                match.get('kickoff', '')
+            )
+            match['match_id'] = match_id
             match['streams'] = m3u8_links.get(match_id, [])
     
     return matches_data, data_source
 
-# HTML Templates (kept the same as before)
+def get_all_matches(date=None):
+    """Get all matches across all competitions for a given date."""
+    all_matches = {}
+    total_count = 0
+    
+    for code, comp_info in COMPETITIONS.items():
+        matches_data, _ = get_matches_for_competition(code, date)
+        if matches_data:
+            all_matches[code] = {
+                'competition': comp_info['name'],
+                'competition_code': code,
+                'matches': matches_data,
+                'count': len(matches_data)
+            }
+            total_count += len(matches_data)
+    
+    return all_matches, total_count
+
+# [HTML Templates - keep the same as before]
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -476,8 +544,10 @@ INDEX_TEMPLATE = '''
         <div class="api-info">
             <h3>📱 API Endpoints for LiveKick App</h3>
             <div class="endpoint">GET /api/competitions - List all competitions</div>
+            <div class="endpoint">GET /api/matches - Get ALL matches for today</div>
             <div class="endpoint">GET /api/matches?code=PL - Get matches for a competition</div>
-            <div class="endpoint">GET /api/matches?status=live - Get all live matches</div>
+            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
+            <div class="endpoint">GET /api/matches/&lt;match_id&gt; - Get a specific match by ID</div>
             <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
         </div>
     </div>
@@ -1026,6 +1096,11 @@ def api_matches_handler():
         status = request.args.get('status')
         code = request.args.get('code')
         date = request.args.get('date')
+        match_id = request.args.get('match_id')
+        
+        # If match_id is provided, return specific match
+        if match_id:
+            return api_match_by_id(match_id)
         
         # If status=live, return live matches
         if status == 'live':
@@ -1075,18 +1150,8 @@ def api_matches_handler():
                 }
             })
         
-        # Default: return all matches grouped by competition
-        all_matches = {}
-        total_count = 0
-        for code, comp_info in COMPETITIONS.items():
-            matches_data, _ = get_matches_for_competition(code, date)
-            if matches_data:
-                all_matches[code] = {
-                    'competition': comp_info['name'],
-                    'matches': matches_data,
-                    'count': len(matches_data)
-                }
-                total_count += len(matches_data)
+        # Default: return ALL matches for today
+        all_matches, total_count = get_all_matches(date)
         
         return jsonify({
             'success': True,
@@ -1125,6 +1190,33 @@ def api_matches_live():
                 'matches': live_matches
             }
         })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/matches/<match_id>', methods=['GET'])
+def api_match_by_id(match_id):
+    """API endpoint to get a specific match by its ID."""
+    try:
+        # Search for the match across all competitions
+        for code, comp_info in COMPETITIONS.items():
+            matches_data, _ = get_matches_for_competition(code)
+            if matches_data:
+                for match in matches_data:
+                    if match.get('match_id') == match_id:
+                        match['competition_code'] = code
+                        match['competition_name'] = comp_info['name']
+                        return jsonify({
+                            'success': True,
+                            'data': match
+                        })
+        
+        return jsonify({
+            'success': False,
+            'error': 'Match not found'
+        }), 404
     except Exception as e:
         return jsonify({
             'success': False,
