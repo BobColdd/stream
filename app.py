@@ -1,4 +1,5 @@
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
+from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
 import json
@@ -6,21 +7,12 @@ import os
 import sqlite3
 from functools import lru_cache
 import time
-import hashlib
-from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'livekick_secret_key_2026')
+CORS(app)  # Enable CORS for Android app
 
-# Simple CORS middleware (no external dependency)
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-# Use persistent disk if available (for Render)
+# Use persistent disk if available
 DATA_DIR = os.environ.get('DATA_DIR', '/opt/render/data')
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -66,38 +58,6 @@ def save_m3u8_links(links):
     conn.commit()
     conn.close()
 
-# Generate a deterministic match ID
-def generate_match_id(source, source_id, home_team, away_team, competition_code, kickoff_time):
-    """
-    Generate a deterministic match ID that will always be the same for the same match.
-    Uses a hash of match details so the ID is consistent across deployments.
-    """
-    # Get the date from kickoff time or use today
-    if kickoff_time:
-        try:
-            # Try to extract date from kickoff time
-            if 'UTC' in kickoff_time:
-                # Format is "HH:MM UTC"
-                dt = datetime.now().strftime('%Y%m%d')
-                date_str = dt
-            else:
-                date_str = datetime.now().strftime('%Y%m%d')
-        except:
-            date_str = datetime.now().strftime('%Y%m%d')
-    else:
-        date_str = datetime.now().strftime('%Y%m%d')
-    
-    # Create a unique string from match details (always the same for the same match)
-    unique_string = f"{competition_code}_{home_team}_{away_team}_{date_str}"
-    
-    # Generate a short hash (first 8 chars of MD5)
-    hash_id = hashlib.md5(unique_string.encode()).hexdigest()[:8]
-    
-    # Create a readable match ID
-    match_id = f"{hash_id}_{competition_code}_{home_team[:3]}_{away_team[:3]}"
-    
-    return match_id
-
 # Competition mapping
 COMPETITIONS = {
     'WC': {'fd_id': 2000, 'espn': 'fifa.world', 'name': 'FIFA World Cup'},
@@ -114,38 +74,29 @@ COMPETITIONS = {
 
 FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac19439794667865a917ad93d187c')
 
-# Simple in-memory cache with TTL
-class SimpleCache:
-    def __init__(self, ttl_seconds=30):  # 30 seconds for live updates
-        self.cache = {}
-        self.ttl = ttl_seconds
-    
-    def get(self, key):
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self.cache[key]
-        return None
-    
-    def set(self, key, value):
-        self.cache[key] = (value, time.time())
-    
-    def clear(self):
-        self.cache = {}
+# Cache for API responses
+cache = {}
+CACHE_DURATION = 300  # 5 minutes
 
-# Cache instances
-competition_cache = SimpleCache(ttl_seconds=3600)  # 1 hour for competitions
-matches_cache = SimpleCache(ttl_seconds=30)  # 30 seconds for matches
+def get_cached(key):
+    """Get cached data if not expired."""
+    if key in cache:
+        data, timestamp = cache[key]
+        if time.time() - timestamp < CACHE_DURATION:
+            return data
+    return None
+
+def set_cache(key, data):
+    """Set cached data with timestamp."""
+    cache[key] = (data, time.time())
+
+@lru_cache(maxsize=1)
+def fetch_competitions_cached():
+    """Fetch competitions with caching."""
+    return fetch_competitions()
 
 def fetch_competitions():
-    """Fetch competitions from football-data.org with caching."""
-    cache_key = 'competitions'
-    cached = competition_cache.get(cache_key)
-    if cached:
-        return cached
-    
+    """Fetch competitions from football-data.org and return as list."""
     url = 'https://api.football-data.org/v4/competitions'
     headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
     
@@ -154,25 +105,30 @@ def fetch_competitions():
         response.raise_for_status()
         data = response.json()
         
-        competitions = {}
+        competitions = []
         for comp in data.get('competitions', []):
             code = comp.get('code')
             if code in COMPETITIONS:
-                competitions[code] = {
+                competitions.append({
+                    'code': code,  # Add code to the competition object
                     'name': COMPETITIONS[code]['name'],
                     'emblem': comp.get('emblem'),
                     'season': comp.get('currentSeason', {}).get('year'),
                     'fd_id': COMPETITIONS[code]['fd_id'],
                     'espn_slug': COMPETITIONS[code]['espn']
-                }
-        
-        competition_cache.set(cache_key, competitions)
+                })
         return competitions
     except Exception as e:
         print(f"Error fetching competitions: {e}")
-        return {code: {'name': info['name'], 'emblem': None, 'season': None, 
-                      'fd_id': info['fd_id'], 'espn_slug': info['espn']} 
-                for code, info in COMPETITIONS.items()}
+        # Return fallback data as list
+        return [{
+            'code': code,
+            'name': info['name'],
+            'emblem': None,
+            'season': None,
+            'fd_id': info['fd_id'],
+            'espn_slug': info['espn']
+        } for code, info in COMPETITIONS.items()]
 
 def fetch_espn_matches(slug, date=None):
     """Fetch matches from ESPN API for a specific date."""
@@ -195,6 +151,7 @@ def fetch_espn_matches(slug, date=None):
             target_date = datetime.now().date()
         
         for event in events:
+            # Get the event date
             date_str = event.get('date')
             if not date_str:
                 continue
@@ -241,44 +198,32 @@ def fetch_espn_matches(slug, date=None):
                 except:
                     kickoff = date_str
             
-            source_id = event.get('id', '')
-            
-            # Get team names and logos
-            home_team = home.get('team', {}).get('displayName', 'Home')
-            away_team = away.get('team', {}).get('displayName', 'Away')
-            home_crest = home.get('team', {}).get('logo')
-            away_crest = away.get('team', {}).get('logo')
+            match_id = event.get('id', '')
             
             matches.append({
-                'home_team': home_team,
-                'away_team': away_team,
-                'home_crest': home_crest,
-                'away_crest': away_crest,
+                'match_id': str(match_id) if match_id else f"espn_{event.get('id', '')}",
+                'home_team': home.get('team', {}).get('displayName', 'Home'),
+                'away_team': away.get('team', {}).get('displayName', 'Away'),
+                'home_crest': home.get('team', {}).get('logo'),
+                'away_crest': away.get('team', {}).get('logo'),
                 'home_score': home_score if home_score is not None else '-',
                 'away_score': away_score if away_score is not None else '-',
                 'status': match_status,
-                'minute': minute if minute else '0\'',
-                'kickoff': kickoff,
-                'source_id': str(source_id),
-                'source': 'espn'
+                'minute': minute,
+                'kickoff': kickoff
             })
         
         return matches
     except Exception as e:
-        print(f"Error fetching ESPN matches for {slug}: {e}")
+        print(f"Error fetching ESPN matches: {e}")
         return None
 
 def fetch_fd_matches(fd_id, date=None):
-    """Fetch matches from football-data.org API."""
+    """Fetch matches from football-data.org API for a specific date."""
     if date:
         date_str = date
     else:
         date_str = datetime.now().strftime('%Y-%m-%d')
-    
-    cache_key = f"fd_{fd_id}_{date_str}"
-    cached = matches_cache.get(cache_key)
-    if cached:
-        return cached
     
     url = f'https://api.football-data.org/v4/competitions/{fd_id}/matches'
     params = {'dateFrom': date_str, 'dateTo': date_str}
@@ -286,15 +231,7 @@ def fetch_fd_matches(fd_id, date=None):
     
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
-        
-        if response.status_code == 429:
-            print(f"Rate limit hit for FD ID {fd_id}, waiting...")
-            time.sleep(2)
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
-        else:
-            response.raise_for_status()
-            
+        response.raise_for_status()
         data = response.json()
         
         matches = []
@@ -328,9 +265,10 @@ def fetch_fd_matches(fd_id, date=None):
                 except:
                     kickoff = utc_date
             
-            source_id = match.get('id', '')
+            match_id = match.get('id', '')
             
             matches.append({
+                'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}",
                 'home_team': home.get('name', 'Home'),
                 'away_team': away.get('name', 'Away'),
                 'home_crest': home.get('crest'),
@@ -339,15 +277,12 @@ def fetch_fd_matches(fd_id, date=None):
                 'away_score': away_score,
                 'status': match_status,
                 'minute': None,
-                'kickoff': kickoff,
-                'source_id': str(source_id),
-                'source': 'fd'
+                'kickoff': kickoff
             })
         
-        matches_cache.set(cache_key, matches)
         return matches
     except Exception as e:
-        print(f"Error fetching FD matches for ID {fd_id}: {e}")
+        print(f"Error fetching FD matches: {e}")
         return None
 
 def get_matches_for_competition(code, date=None):
@@ -368,43 +303,16 @@ def get_matches_for_competition(code, date=None):
         matches_data = fetch_fd_matches(fd_id, date)
         data_source = 'football-data.org'
     
-    # Generate consistent match IDs and attach streams
+    # Load m3u8 links and attach to matches
     m3u8_links = load_m3u8_links()
     if matches_data:
         for match in matches_data:
-            # Generate a deterministic match ID
-            match_id = generate_match_id(
-                match.get('source', 'unknown'),
-                match.get('source_id', ''),
-                match.get('home_team', 'Home'),
-                match.get('away_team', 'Away'),
-                code,
-                match.get('kickoff', '')
-            )
-            match['match_id'] = match_id
+            match_id = match.get('match_id', '')
             match['streams'] = m3u8_links.get(match_id, [])
     
     return matches_data, data_source
 
-def get_all_matches(date=None):
-    """Get all matches across all competitions for a given date."""
-    all_matches = {}
-    total_count = 0
-    
-    for code, comp_info in COMPETITIONS.items():
-        matches_data, _ = get_matches_for_competition(code, date)
-        if matches_data:
-            all_matches[code] = {
-                'competition': comp_info['name'],
-                'competition_code': code,
-                'matches': matches_data,
-                'count': len(matches_data)
-            }
-            total_count += len(matches_data)
-    
-    return all_matches, total_count
-
-# HTML Templates
+# HTML Templates (same as before)
 INDEX_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -412,435 +320,70 @@ INDEX_TEMPLATE = '''
     <title>LiveKick Admin</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-            background: #f5f7fa;
-            color: #333;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        h1 {
-            color: #1a73e8;
-            margin-bottom: 30px;
-            font-weight: 600;
-            font-size: 2rem;
-        }
-        .today-date {
-            color: #666;
-            margin-bottom: 24px;
-            font-size: 1.1rem;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px;
-        }
-        .card {
-            background: white;
-            border-radius: 12px;
-            padding: 24px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-            text-decoration: none;
-            color: #333;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            text-align: center;
-        }
-        .card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
-        }
-        .card img {
-            width: 64px;
-            height: 64px;
-            object-fit: contain;
-            margin-bottom: 12px;
-        }
-        .card h3 {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 4px;
-        }
-        .card .season {
-            color: #777;
-            font-size: 0.9rem;
-        }
-        .api-info {
-            margin-top: 40px;
-            padding: 20px;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-        .api-info h3 {
-            color: #1a73e8;
-            margin-bottom: 12px;
-        }
-        .api-info code {
-            background: #f5f7fa;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 0.9rem;
-        }
-        .api-info .endpoint {
-            margin: 8px 0;
-            padding: 8px 12px;
-            background: #f5f7fa;
-            border-radius: 6px;
-            font-family: monospace;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f5f7fa; color: #333; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { color: #1a73e8; margin-bottom: 30px; font-weight: 600; font-size: 2rem; }
+        .today-date { color: #666; margin-bottom: 24px; font-size: 1.1rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; text-decoration: none; color: #333; display: flex; flex-direction: column; align-items: center; text-align: center; }
+        .card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
+        .card img { width: 64px; height: 64px; object-fit: contain; margin-bottom: 12px; }
+        .card h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; }
+        .card .season { color: #777; font-size: 0.9rem; }
+        .back-btn { display: inline-block; margin-bottom: 20px; padding: 10px 20px; background: #1a73e8; color: white; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 0.95rem; font-weight: 500; }
+        .back-btn:hover { background: #1557b0; }
+        .match-list { display: flex; flex-direction: column; gap: 12px; }
+        .match-item { background: white; border-radius: 12px; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; flex-direction: column; gap: 12px; }
+        .match-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+        .match-teams { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 200px; }
+        .match-teams img { width: 32px; height: 32px; object-fit: contain; }
+        .team-name { font-weight: 500; }
+        .match-info { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .badge { padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge-live { background: #ff1744; color: white; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .badge-ft { background: #e8eaed; color: #555; }
+        .score { font-weight: 700; font-size: 1.1rem; min-width: 60px; text-align: center; }
+        .time { color: #666; font-size: 0.9rem; min-width: 80px; }
+        .minute { color: #1a73e8; font-weight: 600; font-size: 0.85rem; }
+        .source-badge { font-size: 0.7rem; color: #999; margin-top: 8px; text-align: center; }
+        .no-matches { text-align: center; padding: 60px 20px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .no-matches .emoji { font-size: 4rem; margin-bottom: 16px; }
+        .no-matches p { color: #777; font-size: 1.2rem; }
+        .no-matches .date { color: #999; font-size: 1rem; margin-top: 8px; }
+        .m3u8-section { margin-top: 8px; padding-top: 12px; border-top: 1px solid #e8eaed; }
+        .m3u8-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+        .m3u8-header label { font-size: 0.85rem; color: #666; font-weight: 600; }
+        .m3u8-input-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .m3u8-input-row input { flex: 1; min-width: 200px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem; }
+        .m3u8-input-row input:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 2px rgba(26,115,232,0.1); }
+        .m3u8-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+        .m3u8-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 12px; background: #f5f7fa; border-radius: 6px; font-family: monospace; font-size: 0.85rem; word-break: break-all; }
+        .m3u8-item .url { flex: 1; min-width: 150px; }
+        .m3u8-item .remove-btn { background: none; border: none; color: #ff1744; cursor: pointer; font-size: 1.2rem; padding: 0 4px; }
+        .m3u8-item .remove-btn:hover { color: #d50000; }
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; font-weight: 500; cursor: pointer; font-size: 0.85rem; transition: background 0.2s; white-space: nowrap; }
+        .btn-primary { background: #1a73e8; color: white; }
+        .btn-primary:hover { background: #1557b0; }
+        .btn-danger { background: #ff1744; color: white; }
+        .btn-danger:hover { background: #d50000; }
+        .btn-success { background: #00c853; color: white; }
+        .btn-success:hover { background: #009624; }
+        .btn-sm { padding: 4px 12px; font-size: 0.75rem; }
+        .stream-count { font-size: 0.8rem; color: #1a73e8; font-weight: 600; }
+        .no-streams { color: #999; font-size: 0.85rem; font-style: italic; }
+        .api-info { margin-top: 40px; padding: 20px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .api-info h3 { color: #1a73e8; margin-bottom: 12px; }
+        .api-info .endpoint { margin: 8px 0; padding: 8px 12px; background: #f5f7fa; border-radius: 6px; font-family: monospace; }
         @media (max-width: 768px) {
-            .grid {
-                grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🏆 LiveKick Admin</h1>
-        <div class="today-date">📅 {{ today.strftime('%A, %B %d, %Y') }}</div>
-        <div class="grid">
-            {% for code, comp in competitions.items() %}
-            <a href="{{ url_for('matches_web', code=code) }}" class="card">
-                {% if comp.emblem %}
-                <img src="{{ comp.emblem }}" alt="{{ comp.name }}">
-                {% else %}
-                <div style="width:64px;height:64px;background:#e8eaed;border-radius:50%;margin-bottom:12px;"></div>
-                {% endif %}
-                <h3>{{ comp.name }}</h3>
-                <div class="season">{{ comp.season or 'Current Season' }}</div>
-            </a>
-            {% endfor %}
-        </div>
-        
-        <div class="api-info">
-            <h3>📱 API Endpoints for LiveKick App</h3>
-            <div class="endpoint">GET /api/competitions - List all competitions</div>
-            <div class="endpoint">GET /api/matches - Get ALL matches for today</div>
-            <div class="endpoint">GET /api/matches?code=PL - Get matches for a competition</div>
-            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
-            <div class="endpoint">GET /api/matches/&lt;match_id&gt; - Get a specific match by ID</div>
-            <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
-            <div class="endpoint">POST /api/m3u8/&lt;match_id&gt; - Add a stream</div>
-            <div class="endpoint">DELETE /api/m3u8/&lt;match_id&gt; - Remove a stream</div>
-        </div>
-    </div>
-</body>
-</html>
-'''
-
-MATCHES_TEMPLATE = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>LiveKick Admin - {{ competition.name }}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-            background: #f5f7fa;
-            color: #333;
-            padding: 20px;
-        }
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        .header {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            margin-bottom: 8px;
-            flex-wrap: wrap;
-        }
-        .header h1 {
-            color: #1a73e8;
-            font-weight: 600;
-            font-size: 1.8rem;
-        }
-        .sub-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-        .back-btn {
-            display: inline-block;
-            padding: 8px 16px;
-            background: #1a73e8;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            text-decoration: none;
-            font-size: 0.9rem;
-            font-weight: 500;
-        }
-        .back-btn:hover {
-            background: #1557b0;
-        }
-        .today-date {
-            color: #666;
-            font-size: 0.95rem;
-        }
-        .match-list {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        .match-item {
-            background: white;
-            border-radius: 12px;
-            padding: 16px 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-        .match-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-        .match-teams {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            flex: 1;
-            min-width: 200px;
-        }
-        .match-teams img {
-            width: 32px;
-            height: 32px;
-            object-fit: contain;
-        }
-        .team-name {
-            font-weight: 500;
-        }
-        .match-info {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            flex-wrap: wrap;
-        }
-        .badge {
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .badge-live {
-            background: #ff1744;
-            color: white;
-            animation: pulse 1.5s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-        .badge-ft {
-            background: #e8eaed;
-            color: #555;
-        }
-        .score {
-            font-weight: 700;
-            font-size: 1.1rem;
-            min-width: 60px;
-            text-align: center;
-        }
-        .time {
-            color: #666;
-            font-size: 0.9rem;
-            min-width: 80px;
-        }
-        .minute {
-            color: #1a73e8;
-            font-weight: 600;
-            font-size: 0.85rem;
-        }
-        .source-badge {
-            font-size: 0.7rem;
-            color: #999;
-            margin-top: 8px;
-            text-align: center;
-        }
-        .no-matches {
-            text-align: center;
-            padding: 60px 20px;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-        .no-matches .emoji {
-            font-size: 4rem;
-            margin-bottom: 16px;
-        }
-        .no-matches p {
-            color: #777;
-            font-size: 1.2rem;
-        }
-        .no-matches .date {
-            color: #999;
-            font-size: 1rem;
-            margin-top: 8px;
-        }
-        .m3u8-section {
-            margin-top: 8px;
-            padding-top: 12px;
-            border-top: 1px solid #e8eaed;
-        }
-        .m3u8-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 8px;
-            flex-wrap: wrap;
-        }
-        .m3u8-header label {
-            font-size: 0.85rem;
-            color: #666;
-            font-weight: 600;
-        }
-        .m3u8-input-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-        .m3u8-input-row input {
-            flex: 1;
-            min-width: 200px;
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            font-size: 0.9rem;
-        }
-        .m3u8-input-row input:focus {
-            outline: none;
-            border-color: #1a73e8;
-            box-shadow: 0 0 0 2px rgba(26,115,232,0.1);
-        }
-        .m3u8-list {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-top: 8px;
-        }
-        .m3u8-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 6px 12px;
-            background: #f5f7fa;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 0.85rem;
-            word-break: break-all;
-        }
-        .m3u8-item .url {
-            flex: 1;
-            min-width: 150px;
-        }
-        .m3u8-item .remove-btn {
-            background: none;
-            border: none;
-            color: #ff1744;
-            cursor: pointer;
-            font-size: 1.2rem;
-            padding: 0 4px;
-        }
-        .m3u8-item .remove-btn:hover {
-            color: #d50000;
-        }
-        .btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 6px;
-            font-weight: 500;
-            cursor: pointer;
-            font-size: 0.85rem;
-            transition: background 0.2s;
-            white-space: nowrap;
-        }
-        .btn-primary {
-            background: #1a73e8;
-            color: white;
-        }
-        .btn-primary:hover {
-            background: #1557b0;
-        }
-        .btn-danger {
-            background: #ff1744;
-            color: white;
-        }
-        .btn-danger:hover {
-            background: #d50000;
-        }
-        .btn-success {
-            background: #00c853;
-            color: white;
-        }
-        .btn-success:hover {
-            background: #009624;
-        }
-        .btn-sm {
-            padding: 4px 12px;
-            font-size: 0.75rem;
-        }
-        .stream-count {
-            font-size: 0.8rem;
-            color: #1a73e8;
-            font-weight: 600;
-        }
-        .no-streams {
-            color: #999;
-            font-size: 0.85rem;
-            font-style: italic;
-        }
-        @media (max-width: 768px) {
-            .match-row {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            .match-teams {
-                justify-content: center;
-            }
-            .match-info {
-                justify-content: center;
-            }
-            .m3u8-input-row {
-                flex-direction: column;
-            }
-            .m3u8-input-row input {
-                width: 100%;
-            }
-            .m3u8-item {
-                flex-wrap: wrap;
-            }
+            .match-row { flex-direction: column; align-items: stretch; }
+            .match-teams { justify-content: center; }
+            .match-info { justify-content: center; }
+            .m3u8-input-row { flex-direction: column; }
+            .m3u8-input-row input { width: 100%; }
+            .m3u8-item { flex-wrap: wrap; }
+            .grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
         }
     </style>
     <script>
@@ -851,17 +394,13 @@ MATCHES_TEMPLATE = '''
                 alert('Please enter a valid stream URL');
                 return;
             }
-            
             if (!url.startsWith('http://') && !url.startsWith('https://')) {
                 alert('URL must start with http:// or https://');
                 return;
             }
-            
             fetch('/api/m3u8/' + matchId, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: url })
             })
             .then(response => response.json())
@@ -877,17 +416,11 @@ MATCHES_TEMPLATE = '''
                 console.error('Error:', error);
             });
         }
-        
         function removeStream(matchId, url) {
-            if (!confirm('Remove this stream link?')) {
-                return;
-            }
-            
+            if (!confirm('Remove this stream link?')) return;
             fetch('/api/m3u8/' + matchId, {
                 method: 'DELETE',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: url })
             })
             .then(response => response.json())
@@ -903,15 +436,170 @@ MATCHES_TEMPLATE = '''
                 console.error('Error:', error);
             });
         }
-        
         function clearAllStreams(matchId) {
-            if (!confirm('Remove ALL stream links for this match?')) {
+            if (!confirm('Remove ALL stream links for this match?')) return;
+            fetch('/api/m3u8/' + matchId + '/clear', { method: 'DELETE' })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error clearing streams');
+                console.error('Error:', error);
+            });
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>🏆 LiveKick Admin</h1>
+        <div class="today-date">📅 {{ today.strftime('%A, %B %d, %Y') }}</div>
+        <div class="grid">
+            {% for comp in competitions %}
+            <a href="{{ url_for('matches_web', code=comp.code) }}" class="card">
+                {% if comp.emblem %}
+                <img src="{{ comp.emblem }}" alt="{{ comp.name }}">
+                {% else %}
+                <div style="width:64px;height:64px;background:#e8eaed;border-radius:50%;margin-bottom:12px;"></div>
+                {% endif %}
+                <h3>{{ comp.name }}</h3>
+                <div class="season">{{ comp.season or 'Current Season' }}</div>
+            </a>
+            {% endfor %}
+        </div>
+        <div class="api-info">
+            <h3>📱 API Endpoints for LiveKick App</h3>
+            <div class="endpoint">GET /api/competitions - List all competitions (returns array)</div>
+            <div class="endpoint">GET /api/matches/&lt;code&gt; - Get today's matches for a competition</div>
+            <div class="endpoint">GET /api/matches/&lt;code&gt;?date=YYYY-MM-DD - Get matches for specific date</div>
+            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
+            <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+MATCHES_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick Admin - {{ competition.name }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f5f7fa; color: #333; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+        .header h1 { color: #1a73e8; font-weight: 600; font-size: 1.8rem; }
+        .sub-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+        .back-btn { display: inline-block; padding: 8px 16px; background: #1a73e8; color: white; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 0.9rem; font-weight: 500; }
+        .back-btn:hover { background: #1557b0; }
+        .today-date { color: #666; font-size: 0.95rem; }
+        .match-list { display: flex; flex-direction: column; gap: 12px; }
+        .match-item { background: white; border-radius: 12px; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; flex-direction: column; gap: 12px; }
+        .match-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+        .match-teams { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 200px; }
+        .match-teams img { width: 32px; height: 32px; object-fit: contain; }
+        .team-name { font-weight: 500; }
+        .match-info { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .badge { padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge-live { background: #ff1744; color: white; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .badge-ft { background: #e8eaed; color: #555; }
+        .score { font-weight: 700; font-size: 1.1rem; min-width: 60px; text-align: center; }
+        .time { color: #666; font-size: 0.9rem; min-width: 80px; }
+        .minute { color: #1a73e8; font-weight: 600; font-size: 0.85rem; }
+        .source-badge { font-size: 0.7rem; color: #999; margin-top: 8px; text-align: center; }
+        .no-matches { text-align: center; padding: 60px 20px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .no-matches .emoji { font-size: 4rem; margin-bottom: 16px; }
+        .no-matches p { color: #777; font-size: 1.2rem; }
+        .no-matches .date { color: #999; font-size: 1rem; margin-top: 8px; }
+        .m3u8-section { margin-top: 8px; padding-top: 12px; border-top: 1px solid #e8eaed; }
+        .m3u8-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+        .m3u8-header label { font-size: 0.85rem; color: #666; font-weight: 600; }
+        .m3u8-input-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .m3u8-input-row input { flex: 1; min-width: 200px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 0.9rem; }
+        .m3u8-input-row input:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 2px rgba(26,115,232,0.1); }
+        .m3u8-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+        .m3u8-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 12px; background: #f5f7fa; border-radius: 6px; font-family: monospace; font-size: 0.85rem; word-break: break-all; }
+        .m3u8-item .url { flex: 1; min-width: 150px; }
+        .m3u8-item .remove-btn { background: none; border: none; color: #ff1744; cursor: pointer; font-size: 1.2rem; padding: 0 4px; }
+        .m3u8-item .remove-btn:hover { color: #d50000; }
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; font-weight: 500; cursor: pointer; font-size: 0.85rem; transition: background 0.2s; white-space: nowrap; }
+        .btn-primary { background: #1a73e8; color: white; }
+        .btn-primary:hover { background: #1557b0; }
+        .btn-danger { background: #ff1744; color: white; }
+        .btn-danger:hover { background: #d50000; }
+        .btn-sm { padding: 4px 12px; font-size: 0.75rem; }
+        .stream-count { font-size: 0.8rem; color: #1a73e8; font-weight: 600; }
+        .no-streams { color: #999; font-size: 0.85rem; font-style: italic; }
+        @media (max-width: 768px) {
+            .match-row { flex-direction: column; align-items: stretch; }
+            .match-teams { justify-content: center; }
+            .match-info { justify-content: center; }
+            .m3u8-input-row { flex-direction: column; }
+            .m3u8-input-row input { width: 100%; }
+            .m3u8-item { flex-wrap: wrap; }
+        }
+    </style>
+    <script>
+        function addStream(matchId) {
+            const input = document.getElementById('input-' + matchId);
+            const url = input.value.trim();
+            if (!url) {
+                alert('Please enter a valid stream URL');
                 return;
             }
-            
-            fetch('/api/m3u8/' + matchId + '/clear', {
-                method: 'DELETE'
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                alert('URL must start with http:// or https://');
+                return;
+            }
+            fetch('/api/m3u8/' + matchId, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url })
             })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error adding stream');
+                console.error('Error:', error);
+            });
+        }
+        function removeStream(matchId, url) {
+            if (!confirm('Remove this stream link?')) return;
+            fetch('/api/m3u8/' + matchId, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error removing stream');
+                console.error('Error:', error);
+            });
+        }
+        function clearAllStreams(matchId) {
+            if (!confirm('Remove ALL stream links for this match?')) return;
+            fetch('/api/m3u8/' + matchId + '/clear', { method: 'DELETE' })
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
@@ -1013,10 +701,7 @@ MATCHES_TEMPLATE = '''
 </html>
 '''
 
-# =============================================
-# WEB ROUTES (Admin Panel)
-# =============================================
-
+# Web Routes (Admin Panel)
 @app.route('/')
 def index():
     competitions = fetch_competitions()
@@ -1034,7 +719,8 @@ def matches_web(code):
     matches_data, data_source = get_matches_for_competition(code)
     
     competitions = fetch_competitions()
-    comp_display = competitions.get(code, {'name': comp_name, 'emblem': None, 'season': None})
+    comp_display = next((c for c in competitions if c['code'] == code), 
+                       {'name': comp_name, 'emblem': None, 'season': None})
     
     today = datetime.now()
     
@@ -1046,324 +732,194 @@ def matches_web(code):
         today=today
     )
 
-# =============================================
-# API ROUTES FOR ANDROID APP
-# =============================================
-
+# API Routes for LiveKick Android App
 @app.route('/api/competitions', methods=['GET'])
 def api_competitions():
-    """API endpoint to get all competitions."""
-    try:
-        competitions = fetch_competitions()
-        result = []
-        for code, comp in competitions.items():
-            result.append({
-                'code': code,
-                'name': comp['name'],
-                'emblem': comp.get('emblem', ''),
-                'season': comp.get('season', 'Current Season'),
-                'enabled': True
-            })
-        return jsonify({
-            'success': True,
-            'data': result,
-            'count': len(result)
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+    """API endpoint to get all competitions as an array."""
+    competitions = fetch_competitions()
+    return jsonify({
+        'success': True,
+        'data': competitions  # Now returns an array
+    })
 
-@app.route('/api/matches', methods=['GET'])
-def api_matches_handler():
-    """Handle all /api/matches requests from Android app."""
-    try:
-        status = request.args.get('status')
-        code = request.args.get('code')
-        date = request.args.get('date')
-        match_id = request.args.get('match_id')
-        
-        # If match_id is provided, return specific match
-        if match_id:
-            return api_match_by_id(match_id)
-        
-        # If status=live, return live matches
-        if status == 'live':
-            return api_matches_live()
-        
-        # If code is provided, return matches for that competition
-        if code:
-            code = code.upper()
-            if code not in COMPETITIONS:
-                return jsonify({
-                    'success': False,
-                    'error': 'Competition not found'
-                }), 404
-            
-            matches_data, data_source = get_matches_for_competition(code, date)
-            
-            if matches_data is None:
-                return jsonify({
-                    'success': True,
-                    'data': {
-                        'competition': {
-                            'code': code,
-                            'name': COMPETITIONS[code]['name']
-                        },
-                        'date': date or datetime.now().strftime('%Y-%m-%d'),
-                        'source': data_source,
-                        'matches': [],
-                        'count': 0
-                    }
-                })
-            
-            comp_info = COMPETITIONS[code]
-            
-            return jsonify({
-                'success': True,
-                'data': {
-                    'competition': {
-                        'code': code,
-                        'name': comp_info['name'],
-                        'fd_id': comp_info['fd_id'],
-                        'espn_slug': comp_info['espn']
-                    },
-                    'date': date or datetime.now().strftime('%Y-%m-%d'),
-                    'source': data_source,
-                    'matches': matches_data,
-                    'count': len(matches_data)
-                }
-            })
-        
-        # Default: return ALL matches for today
-        all_matches, total_count = get_all_matches(date)
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'matches': all_matches,
-                'total_count': total_count,
-                'date': date or datetime.now().strftime('%Y-%m-%d')
-            }
-        })
-    except Exception as e:
+@app.route('/api/matches/<code>', methods=['GET'])
+def api_matches(code):
+    """API endpoint to get matches for a competition."""
+    if code not in COMPETITIONS:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': 'Competition not found'
+        }), 404
+    
+    date = request.args.get('date')
+    matches_data, data_source = get_matches_for_competition(code, date)
+    
+    if matches_data is None:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to fetch matches'
         }), 500
+    
+    comp_info = COMPETITIONS[code]
+    
+    return jsonify({
+        'success': True,
+        'data': {
+            'competition': {
+                'code': code,
+                'name': comp_info['name'],
+                'fd_id': comp_info['fd_id'],
+                'espn_slug': comp_info['espn']
+            },
+            'date': date or datetime.now().strftime('%Y-%m-%d'),
+            'source': data_source,
+            'matches': matches_data
+        }
+    })
 
 @app.route('/api/matches/live', methods=['GET'])
-def api_matches_live():
-    """API endpoint to get all currently live matches."""
-    try:
-        live_matches = []
+def api_live_matches():
+    """API endpoint to get all currently live matches across all competitions."""
+    live_matches = []
+    
+    for code, comp_info in COMPETITIONS.items():
+        matches_data, _ = get_matches_for_competition(code)
         
-        for code, comp_info in COMPETITIONS.items():
-            matches_data, _ = get_matches_for_competition(code)
-            
-            if matches_data:
-                for match in matches_data:
-                    if match.get('status') == 'LIVE':
-                        match['competition_code'] = code
-                        match['competition_name'] = comp_info['name']
-                        live_matches.append(match)
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'count': len(live_matches),
-                'matches': live_matches
-            }
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/matches/<match_id>', methods=['GET'])
-def api_match_by_id(match_id):
-    """API endpoint to get a specific match by its ID."""
-    try:
-        # Search for the match across all competitions
-        for code, comp_info in COMPETITIONS.items():
-            matches_data, _ = get_matches_for_competition(code)
-            if matches_data:
-                for match in matches_data:
-                    if match.get('match_id') == match_id:
-                        match['competition_code'] = code
-                        match['competition_name'] = comp_info['name']
-                        return jsonify({
-                            'success': True,
-                            'data': match
-                        })
-        
-        return jsonify({
-            'success': False,
-            'error': 'Match not found'
-        }), 404
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        if matches_data:
+            for match in matches_data:
+                if match.get('status') == 'LIVE':
+                    match['competition_code'] = code
+                    match['competition_name'] = comp_info['name']
+                    live_matches.append(match)
+    
+    return jsonify({
+        'success': True,
+        'data': {
+            'count': len(live_matches),
+            'matches': live_matches
+        }
+    })
 
 @app.route('/api/m3u8/<match_id>', methods=['GET', 'POST', 'DELETE'])
 def api_m3u8(match_id):
     """API endpoint to manage m3u8 links for a match."""
-    try:
-        m3u8_links = load_m3u8_links()
-        
-        if request.method == 'GET':
-            """Get all m3u8 links for a match."""
-            streams = m3u8_links.get(match_id, [])
-            return jsonify({
-                'success': True,
-                'data': {
-                    'match_id': match_id,
-                    'streams': streams,
-                    'count': len(streams)
-                }
-            })
-        
-        elif request.method == 'POST':
-            """Add a new m3u8 link for a match."""
-            data = request.get_json()
-            if not data or 'url' not in data:
-                return jsonify({
-                    'success': False,
-                    'error': 'Missing url parameter'
-                }), 400
-            
-            url = data['url'].strip()
-            if not url:
-                return jsonify({
-                    'success': False,
-                    'error': 'URL cannot be empty'
-                }), 400
-            
-            if not url.startswith(('http://', 'https://')):
-                return jsonify({
-                    'success': False,
-                    'error': 'Invalid URL format. Must start with http:// or https://'
-                }), 400
-            
-            streams = m3u8_links.get(match_id, [])
-            
-            if url in streams:
-                return jsonify({
-                    'success': False,
-                    'error': 'This stream URL already exists for this match'
-                }), 400
-            
-            streams.append(url)
-            m3u8_links[match_id] = streams
-            save_m3u8_links(m3u8_links)
-            
-            return jsonify({
-                'success': True,
-                'message': 'Stream added successfully',
-                'data': {
-                    'match_id': match_id,
-                    'streams': streams,
-                    'count': len(streams)
-                }
-            })
-        
-        elif request.method == 'DELETE':
-            """Remove a specific m3u8 link for a match."""
-            data = request.get_json()
-            if not data or 'url' not in data:
-                return jsonify({
-                    'success': False,
-                    'error': 'Missing url parameter'
-                }), 400
-            
-            url = data['url'].strip()
-            streams = m3u8_links.get(match_id, [])
-            
-            if url not in streams:
-                return jsonify({
-                    'success': False,
-                    'error': 'Stream URL not found for this match'
-                }), 404
-            
-            streams.remove(url)
-            
-            if streams:
-                m3u8_links[match_id] = streams
-            else:
-                del m3u8_links[match_id]
-            
-            save_m3u8_links(m3u8_links)
-            
-            return jsonify({
-                'success': True,
-                'message': 'Stream removed successfully',
-                'data': {
-                    'match_id': match_id,
-                    'streams': streams,
-                    'count': len(streams)
-                }
-            })
-    except Exception as e:
+    m3u8_links = load_m3u8_links()
+    
+    if request.method == 'GET':
+        streams = m3u8_links.get(match_id, [])
         return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+            'success': True,
+            'data': {
+                'match_id': match_id,
+                'streams': streams,
+                'count': len(streams)
+            }
+        })
+    
+    elif request.method == 'POST':
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing url parameter'
+            }), 400
+        
+        url = data['url'].strip()
+        if not url:
+            return jsonify({
+                'success': False,
+                'error': 'URL cannot be empty'
+            }), 400
+        
+        if not url.startswith(('http://', 'https://')):
+            return jsonify({
+                'success': False,
+                'error': 'Invalid URL format. Must start with http:// or https://'
+            }), 400
+        
+        streams = m3u8_links.get(match_id, [])
+        
+        if url in streams:
+            return jsonify({
+                'success': False,
+                'error': 'This stream URL already exists for this match'
+            }), 400
+        
+        streams.append(url)
+        m3u8_links[match_id] = streams
+        save_m3u8_links(m3u8_links)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Stream added successfully',
+            'data': {
+                'match_id': match_id,
+                'streams': streams,
+                'count': len(streams)
+            }
+        })
+    
+    elif request.method == 'DELETE':
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing url parameter'
+            }), 400
+        
+        url = data['url'].strip()
+        streams = m3u8_links.get(match_id, [])
+        
+        if url not in streams:
+            return jsonify({
+                'success': False,
+                'error': 'Stream URL not found for this match'
+            }), 404
+        
+        streams.remove(url)
+        
+        if streams:
+            m3u8_links[match_id] = streams
+        else:
+            del m3u8_links[match_id]
+        
+        save_m3u8_links(m3u8_links)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Stream removed successfully',
+            'data': {
+                'match_id': match_id,
+                'streams': streams,
+                'count': len(streams)
+            }
+        })
 
 @app.route('/api/m3u8/<match_id>/clear', methods=['DELETE'])
 def api_m3u8_clear(match_id):
     """Clear all m3u8 links for a match."""
-    try:
-        m3u8_links = load_m3u8_links()
-        
-        if match_id in m3u8_links:
-            del m3u8_links[match_id]
-            save_m3u8_links(m3u8_links)
-            return jsonify({
-                'success': True,
-                'message': 'All streams cleared successfully'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'No streams found for this match'
-            }), 404
-    except Exception as e:
+    m3u8_links = load_m3u8_links()
+    
+    if match_id in m3u8_links:
+        del m3u8_links[match_id]
+        save_m3u8_links(m3u8_links)
+        return jsonify({
+            'success': True,
+            'message': 'All streams cleared successfully'
+        })
+    else:
         return jsonify({
             'success': False,
-            'error': str(e)
-        }), 500
+            'error': 'No streams found for this match'
+        }), 404
 
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
     """Health check endpoint for Render."""
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0',
-        'competitions': len(COMPETITIONS)
+        'timestamp': datetime.now().isoformat()
     })
-
-# =============================================
-# ERROR HANDLERS
-# =============================================
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'success': False,
-        'error': 'Endpoint not found'
-    }), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'success': False,
-        'error': 'Internal server error'
-    }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
