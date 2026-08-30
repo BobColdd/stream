@@ -54,9 +54,12 @@ def load_active_leagues():
     return {code: info['default'] for code, info in ALL_LEAGUES.items()}
 
 def save_active_leagues(active_leagues):
-    os.makedirs(os.path.dirname(ACTIVE_LEAGUES_FILE), exist_ok=True)
-    with open(ACTIVE_LEAGUES_FILE, 'w') as f:
-        json.dump(active_leagues, f, indent=2)
+    try:
+        os.makedirs(os.path.dirname(ACTIVE_LEAGUES_FILE), exist_ok=True)
+        with open(ACTIVE_LEAGUES_FILE, 'w') as f:
+            json.dump(active_leagues, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving active leagues: {e}")
 
 active_leagues = load_active_leagues()
 logger.info(f"Active leagues: {[k for k, v in active_leagues.items() if v]}")
@@ -78,48 +81,66 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 # Data directories
 DATA_DIR = os.environ.get('DATA_DIR', '/opt/render/data')
 if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except:
+        DATA_DIR = '/tmp/data'
+        os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, 'streams.db')
 CLIP_STORAGE_DIR = os.path.join(DATA_DIR, 'clips')
-os.makedirs(CLIP_STORAGE_DIR, exist_ok=True)
+try:
+    os.makedirs(CLIP_STORAGE_DIR, exist_ok=True)
+except:
+    CLIP_STORAGE_DIR = '/tmp/clips'
+    os.makedirs(CLIP_STORAGE_DIR, exist_ok=True)
 
 # ============================================
 # DATABASE
 # ============================================
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS streams
-                 (match_id TEXT, url TEXT, PRIMARY KEY (match_id, url))''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS streams
+                     (match_id TEXT, url TEXT, PRIMARY KEY (match_id, url))''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
 
 init_db()
 
 def load_m3u8_links():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT match_id, url FROM streams')
-    rows = c.fetchall()
-    conn.close()
-    links = {}
-    for match_id, url in rows:
-        if match_id not in links:
-            links[match_id] = []
-        links[match_id].append(url)
-    return links
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT match_id, url FROM streams')
+        rows = c.fetchall()
+        conn.close()
+        links = {}
+        for match_id, url in rows:
+            if match_id not in links:
+                links[match_id] = []
+            links[match_id].append(url)
+        return links
+    except Exception as e:
+        logger.error(f"Error loading m3u8 links: {e}")
+        return {}
 
 def save_m3u8_links(links):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM streams')
-    for match_id, urls in links.items():
-        for url in urls:
-            c.execute('INSERT INTO streams (match_id, url) VALUES (?, ?)', (match_id, url))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('DELETE FROM streams')
+        for match_id, urls in links.items():
+            for url in urls:
+                c.execute('INSERT INTO streams (match_id, url) VALUES (?, ?)', (match_id, url))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving m3u8 links: {e}")
 
 # ============================================
 # CACHE
@@ -227,7 +248,7 @@ def fetch_fd_fixtures(fd_id, date_str):
         return fixtures
     except Exception as e:
         logger.error(f"Error fetching FD fixtures: {e}")
-        return None
+        return []
 
 def fetch_daily_fixtures():
     """Fetch today's fixtures for all active leagues."""
@@ -321,8 +342,10 @@ def get_matches_for_today(code):
         comp_info = COMPETITIONS.get(code)
         if comp_info:
             fixtures = fetch_fd_fixtures(comp_info['fd_id'], today)
-            if fixtures is not None:
+            if fixtures is not None and len(fixtures) > 0:
                 cache.set(fixtures_key, fixtures, 86400)
+        else:
+            fixtures = []
     
     # Get live matches from ESPN
     comp_info = COMPETITIONS.get(code)
@@ -366,7 +389,7 @@ def get_all_today_matches():
         comp_info = COMPETITIONS.get(code)
         for match in matches:
             match['competition_code'] = code
-            match['competition_name'] = comp_info['name']
+            match['competition_name'] = comp_info['name'] if comp_info else code
         
         all_matches.extend(matches)
     
@@ -415,20 +438,24 @@ def schedule_daily_fetch():
     """Schedule daily fixture fetch at 1 AM EAT."""
     def scheduler():
         while True:
-            now = datetime.now()
-            # 1 AM EAT = 10 PM UTC (22:00)
-            target_hour = 22
-            target_minute = 0
-            
-            next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-            if now > next_run:
-                next_run += timedelta(days=1)
-            
-            wait_seconds = (next_run - now).total_seconds()
-            logger.info(f"Next fixture fetch at {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            time.sleep(wait_seconds)
-            fetch_daily_fixtures()
+            try:
+                now = datetime.now()
+                # 1 AM EAT = 10 PM UTC (22:00)
+                target_hour = 22
+                target_minute = 0
+                
+                next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+                if now > next_run:
+                    next_run += timedelta(days=1)
+                
+                wait_seconds = (next_run - now).total_seconds()
+                logger.info(f"Next fixture fetch at {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                time.sleep(wait_seconds)
+                fetch_daily_fixtures()
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
+                time.sleep(60)
     
     thread = threading.Thread(target=scheduler, daemon=True)
     thread.start()
@@ -441,218 +468,273 @@ def schedule_daily_fetch():
 @app.route('/api/matches', methods=['GET'])
 def api_matches():
     """Get all matches for today (scheduled + live)."""
-    today = datetime.now().strftime('%Y-%m-%d')
-    force_refresh = request.args.get('refresh') == 'true'
-    
-    cache_key = f"all_matches_{today}"
-    
-    if not force_refresh:
-        cached = cache.get(cache_key)
-        if cached:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'date': today,
-                    'matches': cached
-                }
-            })
-    
-    matches = get_all_today_matches()
-    
-    # Cache for 1 minute
-    cache.set(cache_key, matches, 60)
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'date': today,
-            'matches': matches
-        }
-    })
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        force_refresh = request.args.get('refresh') == 'true'
+        
+        cache_key = f"all_matches_{today}"
+        
+        if not force_refresh:
+            cached = cache.get(cache_key)
+            if cached:
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'date': today,
+                        'matches': cached
+                    }
+                })
+        
+        matches = get_all_today_matches()
+        
+        # Cache for 1 minute
+        cache.set(cache_key, matches, 60)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'date': today,
+                'matches': matches
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in api_matches: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/matches/live', methods=['GET'])
 def api_live_matches():
     """Get only currently live matches."""
-    # Get from cache (updated every 15 seconds)
-    live = cache.get('live_matches_cached')
-    
-    if live is None:
-        # Fetch fresh if cache is empty
-        live = []
-        for code in COMPETITIONS.keys():
-            if not active_leagues.get(code, False):
-                continue
-            comp_info = COMPETITIONS.get(code)
-            if comp_info:
-                matches = fetch_espn_live_matches(comp_info['espn'])
-                for match in matches:
-                    match['competition_code'] = code
-                    match['competition_name'] = comp_info['name']
-                live.extend(matches)
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'count': len(live),
-            'matches': live
-        }
-    })
+    try:
+        # Get from cache (updated every 15 seconds)
+        live = cache.get('live_matches_cached')
+        
+        if live is None:
+            # Fetch fresh if cache is empty
+            live = []
+            for code in COMPETITIONS.keys():
+                if not active_leagues.get(code, False):
+                    continue
+                comp_info = COMPETITIONS.get(code)
+                if comp_info:
+                    matches = fetch_espn_live_matches(comp_info['espn'])
+                    for match in matches:
+                        match['competition_code'] = code
+                        match['competition_name'] = comp_info['name']
+                    live.extend(matches)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'count': len(live),
+                'matches': live
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in api_live_matches: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/matches/<code>', methods=['GET'])
 def api_matches_by_league(code):
     """Get matches for a specific league today."""
-    if code not in COMPETITIONS:
-        return jsonify({'success': False, 'error': 'League not found or inactive'}), 404
-    
-    if not active_leagues.get(code, False):
-        return jsonify({'success': False, 'error': 'League is inactive'}), 404
-    
-    matches = get_matches_for_today(code)
-    comp_info = COMPETITIONS.get(code)
-    
-    return jsonify({
-        'success': True,
-        'data': {
-            'competition': {
-                'code': code,
-                'name': comp_info['name'],
-                'fd_id': comp_info['fd_id'],
-                'espn_slug': comp_info['espn']
-            },
-            'matches': matches
-        }
-    })
+    try:
+        if code not in COMPETITIONS:
+            return jsonify({'success': False, 'error': 'League not found or inactive'}), 404
+        
+        if not active_leagues.get(code, False):
+            return jsonify({'success': False, 'error': 'League is inactive'}), 404
+        
+        matches = get_matches_for_today(code)
+        comp_info = COMPETITIONS.get(code)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'competition': {
+                    'code': code,
+                    'name': comp_info['name'] if comp_info else code,
+                    'fd_id': comp_info['fd_id'] if comp_info else None,
+                    'espn_slug': comp_info['espn'] if comp_info else None
+                },
+                'matches': matches
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in api_matches_by_league: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/competitions', methods=['GET'])
 def api_competitions():
     """Get all active competitions."""
-    competitions = []
-    for code, info in COMPETITIONS.items():
-        if active_leagues.get(code, False):
-            competitions.append({
-                'code': code,
-                'name': info['name'],
-                'fd_id': info['fd_id'],
-                'espn_slug': info['espn']
-            })
-    return jsonify({'success': True, 'data': competitions})
+    try:
+        competitions = []
+        for code, info in COMPETITIONS.items():
+            if active_leagues.get(code, False):
+                competitions.append({
+                    'code': code,
+                    'name': info['name'],
+                    'fd_id': info['fd_id'],
+                    'espn_slug': info['espn']
+                })
+        return jsonify({'success': True, 'data': competitions})
+    except Exception as e:
+        logger.error(f"Error in api_competitions: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/leagues', methods=['GET'])
 def api_leagues():
     """Get all leagues with their active status."""
-    leagues = []
-    for code, info in ALL_LEAGUES.items():
-        leagues.append({
-            'code': code,
-            'name': info['name'],
-            'active': active_leagues.get(code, False),
-            'default': info['default']
-        })
-    return jsonify({'success': True, 'data': leagues})
+    try:
+        leagues = []
+        for code, info in ALL_LEAGUES.items():
+            leagues.append({
+                'code': code,
+                'name': info['name'],
+                'active': active_leagues.get(code, False),
+                'default': info['default']
+            })
+        return jsonify({'success': True, 'data': leagues})
+    except Exception as e:
+        logger.error(f"Error in api_leagues: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/leagues', methods=['POST'])
 def api_update_leagues():
     """Update active leagues."""
-    data = request.get_json()
-    if not data or 'leagues' not in data:
-        return jsonify({'success': False, 'error': 'Missing leagues data'}), 400
-    
-    new_active = data['leagues']
-    
-    # Validate
-    for code in new_active.keys():
-        if code not in ALL_LEAGUES:
-            return jsonify({'success': False, 'error': f'Invalid league: {code}'}), 400
-    
-    # Save
-    global active_leagues, COMPETITIONS
-    active_leagues = new_active
-    save_active_leagues(active_leagues)
-    COMPETITIONS = get_active_competitions()
-    
-    # Clear cache to force refresh
-    cache.clear()
-    
-    logger.info(f"Updated active leagues: {[k for k, v in active_leagues.items() if v]}")
-    
-    return jsonify({
-        'success': True,
-        'message': 'Leagues updated successfully',
-        'data': {
-            'active': [k for k, v in active_leagues.items() if v],
-            'inactive': [k for k, v in active_leagues.items() if not v]
-        }
-    })
+    try:
+        data = request.get_json()
+        if not data or 'leagues' not in data:
+            return jsonify({'success': False, 'error': 'Missing leagues data'}), 400
+        
+        new_active = data['leagues']
+        
+        # Validate
+        for code in new_active.keys():
+            if code not in ALL_LEAGUES:
+                return jsonify({'success': False, 'error': f'Invalid league: {code}'}), 400
+        
+        # Save
+        global active_leagues, COMPETITIONS
+        active_leagues = new_active
+        save_active_leagues(active_leagues)
+        COMPETITIONS = get_active_competitions()
+        
+        # Clear cache to force refresh
+        cache.clear()
+        
+        logger.info(f"Updated active leagues: {[k for k, v in active_leagues.items() if v]}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Leagues updated successfully',
+            'data': {
+                'active': [k for k, v in active_leagues.items() if v],
+                'inactive': [k for k, v in active_leagues.items() if not v]
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in api_update_leagues: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/m3u8/<match_id>', methods=['GET', 'POST', 'DELETE'])
 def api_m3u8(match_id):
     """Manage m3u8 links for a match."""
-    m3u8_links = load_m3u8_links()
-    
-    if request.method == 'GET':
-        streams = m3u8_links.get(match_id, [])
-        return jsonify({
-            'success': True,
-            'data': {
-                'match_id': match_id,
-                'streams': streams,
-                'count': len(streams)
-            }
-        })
-    
-    elif request.method == 'POST':
-        data = request.get_json()
-        if not data or 'url' not in data:
-            return jsonify({'success': False, 'error': 'Missing url'}), 400
+    try:
+        m3u8_links = load_m3u8_links()
         
-        url = data['url'].strip()
-        if not url or not url.startswith(('http://', 'https://')):
-            return jsonify({'success': False, 'error': 'Invalid URL'}), 400
+        if request.method == 'GET':
+            streams = m3u8_links.get(match_id, [])
+            return jsonify({
+                'success': True,
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
+            })
         
-        streams = m3u8_links.get(match_id, [])
-        if url in streams:
-            return jsonify({'success': False, 'error': 'Stream already exists'}), 400
-        
-        streams.append(url)
-        m3u8_links[match_id] = streams
-        save_m3u8_links(m3u8_links)
-        
-        return jsonify({
-            'success': True,
-            'message': 'Stream added',
-            'data': {'match_id': match_id, 'streams': streams, 'count': len(streams)}
-        })
-    
-    elif request.method == 'DELETE':
-        data = request.get_json()
-        if not data or 'url' not in data:
-            return jsonify({'success': False, 'error': 'Missing url'}), 400
-        
-        url = data['url'].strip()
-        streams = m3u8_links.get(match_id, [])
-        
-        if url not in streams:
-            return jsonify({'success': False, 'error': 'Stream not found'}), 404
-        
-        streams.remove(url)
-        if streams:
+        elif request.method == 'POST':
+            data = request.get_json()
+            if not data or 'url' not in data:
+                return jsonify({'success': False, 'error': 'Missing url'}), 400
+            
+            url = data['url'].strip()
+            if not url or not url.startswith(('http://', 'https://')):
+                return jsonify({'success': False, 'error': 'Invalid URL'}), 400
+            
+            streams = m3u8_links.get(match_id, [])
+            if url in streams:
+                return jsonify({'success': False, 'error': 'Stream already exists'}), 400
+            
+            streams.append(url)
             m3u8_links[match_id] = streams
-        else:
-            del m3u8_links[match_id]
+            save_m3u8_links(m3u8_links)
+            
+            return jsonify({
+                'success': True,
+                'message': 'Stream added',
+                'data': {'match_id': match_id, 'streams': streams, 'count': len(streams)}
+            })
         
-        save_m3u8_links(m3u8_links)
-        
-        return jsonify({'success': True, 'message': 'Stream removed'})
+        elif request.method == 'DELETE':
+            data = request.get_json()
+            if not data or 'url' not in data:
+                return jsonify({'success': False, 'error': 'Missing url'}), 400
+            
+            url = data['url'].strip()
+            streams = m3u8_links.get(match_id, [])
+            
+            if url not in streams:
+                return jsonify({'success': False, 'error': 'Stream not found'}), 404
+            
+            streams.remove(url)
+            if streams:
+                m3u8_links[match_id] = streams
+            else:
+                del m3u8_links[match_id]
+            
+            save_m3u8_links(m3u8_links)
+            
+            return jsonify({'success': True, 'message': 'Stream removed'})
+    except Exception as e:
+        logger.error(f"Error in api_m3u8: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/health')
 def health():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'port': PORT,
-        'active_leagues': [k for k, v in active_leagues.items() if v],
-        'cache_size': len(cache._cache)
-    })
+    try:
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'port': PORT,
+            'active_leagues': [k for k, v in active_leagues.items() if v],
+            'cache_size': len(cache._cache)
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
 
 # ============================================
 # WEB ROUTES (Admin Panel)
@@ -660,17 +742,14 @@ def health():
 
 @app.route('/')
 def index():
-    """Main dashboard."""
     return render_template('index.html')
 
 @app.route('/admin/leagues')
 def admin_leagues():
-    """League management page."""
     return render_template('leagues.html')
 
 @app.route('/admin/matches')
 def admin_matches():
-    """Match management page."""
     return render_template('matches.html')
 
 # ============================================
@@ -690,12 +769,15 @@ def internal_error(error):
 # ============================================
 
 if __name__ == '__main__':
-    # Start background services
-    start_background_updater()
-    schedule_daily_fetch()
-    
-    # Initial fetch
-    fetch_daily_fixtures()
+    try:
+        # Start background services
+        start_background_updater()
+        schedule_daily_fetch()
+        
+        # Initial fetch
+        fetch_daily_fixtures()
+    except Exception as e:
+        logger.error(f"Error starting services: {e}")
     
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
