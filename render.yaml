@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: livekick
+    env: python
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: BACKEND_URL
+        value: https://api.football-data.org/v4
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: false
+      - key: DATA_DIR
+        value: /opt/render/data
+    disk:
+      name: data
+      mountPath: /opt/render/data
+      sizeGB: 5
+    healthCheckPath: /health
+    autoDeploy: true
