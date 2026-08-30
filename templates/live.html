@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick Admin - Live Matches</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f5f7fa; color: #333; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+        .header h1 { color: #ff1744; font-weight: 600; font-size: 1.8rem; }
+        .sub-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+        .back-btn { display: inline-block; padding: 8px 16px; background: #1a73e8; color: white; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 0.9rem; font-weight: 500; }
+        .back-btn:hover { background: #1557b0; }
+        .match-list { display: flex; flex-direction: column; gap: 12px; }
+        .match-item { background: white; border-radius: 12px; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); display: flex; flex-direction: column; gap: 12px; border-left: 4px solid #ff1744; }
+        .match-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+        .match-teams { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 200px; }
+        .match-teams img { width: 32px; height: 32px; object-fit: contain; }
+        .team-name { font-weight: 500; }
+        .match-info { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .badge { padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+        .badge-live { background: #ff1744; color: white; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .badge-ft { background: #e8eaed; color: #555; }
+        .score { font-weight: 700; font-size: 1.1rem; min-width: 60px; text-align: center; }
+        .minute { color: #1a73e8; font-weight: 600; font-size: 0.85rem; }
+        .removing-in { color: #ff6b00; font-size: 0.8rem; font-weight: 600; }
+        .competition-tag { font-size: 0.8rem; color: #666; background: #f5f7fa; padding: 2px 10px; border-radius: 4px; }
+        .no-matches { text-align: center; padding: 60px 20px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .no-matches .emoji { font-size: 4rem; margin-bottom: 16px; }
+        .no-matches p { color: #777; font-size: 1.2rem; }
+        .clip-item { display: inline-block; padding: 2px 8px; background: #e3f2fd; border-radius: 4px; font-size: 0.75rem; margin-right: 4px; }
+        .clip-item a { color: #1a73e8; text-decoration: none; }
+        .clip-item a:hover { text-decoration: underline; }
+        @media (max-width: 768px) {
+            .match-row { flex-direction: column; align-items: stretch; }
+            .match-teams { justify-content: center; }
+            .match-info { justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="{{ url_for('index') }}" class="back-btn">← Back</a>
+            <h1>🔴 Live Matches</h1>
+        </div>
+        <div class="sub-header">
+            <div class="today-date">📅 {{ live_matches|length }} matches currently live</div>
+            <a href="{{ url_for('live_matches_web') }}" class="back-btn" style="background:#666;">⟳ Refresh</a>
+        </div>
+        
+        {% if live_matches %}
+        <div class="match-list">
+            {% for match in live_matches %}
+            <div class="match-item">
+                <div class="match-row">
+                    <div class="match-teams">
+                        <span class="competition-tag">{{ match.competition_name }}</span>
+                        {% if match.home_crest %}
+                        <img src="{{ match.home_crest }}" alt="{{ match.home_team }}">
+                        {% endif %}
+                        <span class="team-name">{{ match.home_team }}</span>
+                        <span style="color:#999;">vs</span>
+                        <span class="team-name">{{ match.away_team }}</span>
+                        {% if match.away_crest %}
+                        <img src="{{ match.away_crest }}" alt="{{ match.away_team }}">
+                        {% endif %}
+                    </div>
+                    <div class="match-info">
+                        {% if match.status == 'LIVE' %}
+                            <span class="badge badge-live">LIVE</span>
+                            <span class="score">{{ match.home_score }} - {{ match.away_score }}</span>
+                            {% if match.minute %}
+                            <span class="minute">{{ match.minute }}'</span>
+                            {% endif %}
+                        {% elif match.status == 'FINISHED' %}
+                            <span class="badge badge-ft">FT</span>
+                            <span class="score">{{ match.home_score }} - {{ match.away_score }}</span>
+                            {% if match.removing_in %}
+                            <span class="removing-in">⏱️ Removing in {{ match.removing_in|round(1) }} min</span>
+                            {% endif %}
+                        {% endif %}
+                    </div>
+                </div>
+                {% if match.clips %}
+                <div style="margin-top: 4px;">
+                    <span style="font-size:0.8rem;color:#666;">⚽ Clips:</span>
+                    {% for clip in match.clips %}
+                    <span class="clip-item">
+                        <a href="{{ clip.url }}" target="_blank">{{ clip.goal_team }} ({{ clip.score }})</a>
+                    </span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="no-matches">
+            <div class="emoji">⚽</div>
+            <p>No live matches at the moment</p>
+            <p style="color:#999;font-size:1rem;">Check back later for live action</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
