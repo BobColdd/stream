@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick Admin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f5f7fa; color: #333; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { color: #1a73e8; margin-bottom: 30px; font-weight: 600; font-size: 2rem; }
+        .today-date { color: #666; margin-bottom: 24px; font-size: 1.1rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 12px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; text-decoration: none; color: #333; display: flex; flex-direction: column; align-items: center; text-align: center; }
+        .card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
+        .card img { width: 64px; height: 64px; object-fit: contain; margin-bottom: 12px; }
+        .card h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; }
+        .card .season { color: #777; font-size: 0.9rem; }
+        .api-info { margin-top: 40px; padding: 20px; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .api-info h3 { color: #1a73e8; margin-bottom: 12px; }
+        .api-info .endpoint { margin: 8px 0; padding: 8px 12px; background: #f5f7fa; border-radius: 6px; font-family: monospace; }
+        @media (max-width: 768px) { .grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏆 LiveKick Admin</h1>
+        <div class="today-date">📅 {{ today.strftime('%A, %B %d, %Y') }}</div>
+        <div class="grid">
+            {% for comp in competitions %}
+            <a href="{{ url_for('matches_web', code=comp.code) }}" class="card">
+                {% if comp.emblem %}
+                <img src="{{ comp.emblem }}" alt="{{ comp.name }}">
+                {% else %}
+                <div style="width:64px;height:64px;background:#e8eaed;border-radius:50%;margin-bottom:12px;"></div>
+                {% endif %}
+                <h3>{{ comp.name }}</h3>
+                <div class="season">{{ comp.season or 'Current Season' }}</div>
+            </a>
+            {% endfor %}
+        </div>
+        <div class="api-info">
+            <h3>📱 API Endpoints for LiveKick App</h3>
+            <div class="endpoint">GET /api/competitions - List all competitions (returns array)</div>
+            <div class="endpoint">GET /api/matches/&lt;code&gt; - Get today's matches for a competition</div>
+            <div class="endpoint">GET /api/matches/&lt;code&gt;?date=YYYY-MM-DD - Get matches for specific date</div>
+            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
+            <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
+            <div class="endpoint">GET /api/clips/&lt;match_id&gt; - Get goal clips for a match</div>
+        </div>
+    </div>
+</body>
+</html>
