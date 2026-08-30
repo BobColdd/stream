@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick - Goal Clips</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; background: #f5f7fa; color: #333; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .back-btn { display: inline-block; padding: 8px 16px; background: #1a73e8; color: white; border: none; border-radius: 8px; cursor: pointer; text-decoration: none; font-size: 0.9rem; margin-bottom: 20px; }
+        .back-btn:hover { background: #1557b0; }
+        h1 { color: #1a73e8; margin-bottom: 20px; }
+        .clip-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px; }
+        .clip-card { background: white; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .clip-card video { width: 100%; border-radius: 8px; background: #000; }
+        .clip-card .info { margin-top: 8px; }
+        .clip-card .info .label { font-weight: 600; }
+        .clip-card .info .value { color: #666; }
+        .no-clips { text-align: center; padding: 60px 20px; background: white; border-radius: 12px; }
+        .no-clips .emoji { font-size: 4rem; margin-bottom: 16px; }
+        .no-clips p { color: #777; font-size: 1.2rem; }
+        @media (max-width: 768px) { .clip-grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="javascript:history.back()" class="back-btn">← Back</a>
+        <h1>⚽ Goal Clips - Match {{ match_id }}</h1>
+        
+        {% if clips %}
+        <div class="clip-grid">
+            {% for clip in clips %}
+            <div class="clip-card">
+                <video controls>
+                    <source src="{{ clip.url }}" type="video/mp4">
+                    Your browser does not support video playback.
+                </video>
+                <div class="info">
+                    <div><span class="label">Goal:</span> <span class="value">{{ clip.goal_team }} scored</span></div>
+                    <div><span class="label">Score:</span> <span class="value">{{ clip.score }}</span></div>
+                    <div><span class="label">Time:</span> <span class="value">{{ clip.timestamp[:16] }}</span></div>
+                    <div><span class="label">Duration:</span> <span class="value">{{ clip.duration }} seconds</span></div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="no-clips">
+            <div class="emoji">😕</div>
+            <p>No goal clips available for this match</p>
+            <p style="color:#999;font-size:1rem;">Goals will appear here when detected</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
