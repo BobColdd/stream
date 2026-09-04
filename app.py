@@ -1,227 +1,300 @@
-from flask import Flask, render_template, request, jsonify, send_file
-from flask_cors import CORS
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
 import requests
 from datetime import datetime, timedelta
-import os
-import logging
-from dotenv import load_dotenv
-import time
 import json
-import threading
+import os
 import sqlite3
-from functools import wraps
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from functools import lru_cache
+import time
+from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'livekick_secret_key_2026')
-CORS(app)
 
-# ============================================
-# LEAGUE MANAGEMENT
-# ============================================
+# Simple CORS middleware (no external dependency)
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
-ALL_LEAGUES = {
-    'PL': {'fd_id': 2021, 'espn': 'eng.1', 'name': 'Premier League', 'default': True},
-    'CL': {'fd_id': 2001, 'espn': 'uefa.champions', 'name': 'Champions League', 'default': True},
-    'BL1': {'fd_id': 2002, 'espn': 'ger.1', 'name': 'Bundesliga', 'default': True},
-    'SA': {'fd_id': 2019, 'espn': 'ita.1', 'name': 'Serie A', 'default': True},
-    'PD': {'fd_id': 2014, 'espn': 'esp.1', 'name': 'La Liga', 'default': True},
-    'FL1': {'fd_id': 2015, 'espn': 'fra.1', 'name': 'Ligue 1', 'default': True},
-    'FA': {'fd_id': 2016, 'espn': 'eng.3', 'name': 'FA Cup', 'default': False},
-    'ELC': {'fd_id': 2016, 'espn': 'eng.2', 'name': 'Championship', 'default': False},
-    'DED': {'fd_id': 2003, 'espn': 'ned.1', 'name': 'Eredivisie', 'default': False},
-    'CLI': {'fd_id': 2152, 'espn': 'conmebol.libertadores', 'name': 'Copa Libertadores', 'default': False},
-    'WC': {'fd_id': 2000, 'espn': 'fifa.world', 'name': 'World Cup', 'default': False},
-}
-
-ACTIVE_LEAGUES_FILE = os.path.join(os.environ.get('DATA_DIR', '/opt/render/data'), 'active_leagues.json')
-
-def load_active_leagues():
-    if os.path.exists(ACTIVE_LEAGUES_FILE):
-        try:
-            with open(ACTIVE_LEAGUES_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {code: info['default'] for code, info in ALL_LEAGUES.items()}
-
-def save_active_leagues(active_leagues):
-    try:
-        os.makedirs(os.path.dirname(ACTIVE_LEAGUES_FILE), exist_ok=True)
-        with open(ACTIVE_LEAGUES_FILE, 'w') as f:
-            json.dump(active_leagues, f, indent=2)
-    except Exception as e:
-        logger.error(f"Error saving active leagues: {e}")
-
-active_leagues = load_active_leagues()
-logger.info(f"Active leagues: {[k for k, v in active_leagues.items() if v]}")
-
-def get_active_competitions():
-    return {code: info for code, info in ALL_LEAGUES.items() if active_leagues.get(code, False)}
-
-COMPETITIONS = get_active_competitions()
-
-# ============================================
-# CONFIGURATION
-# ============================================
-
-BACKEND_URL = os.getenv('BACKEND_URL', 'https://api.football-data.org/v4')
-FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac19439794667865a917ad93d187c')
-PORT = int(os.getenv('PORT', 5000))
-DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
-
-# Data directories
+# Use persistent disk if available (for Render)
 DATA_DIR = os.environ.get('DATA_DIR', '/opt/render/data')
 if not os.path.exists(DATA_DIR):
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-    except:
-        DATA_DIR = '/tmp/data'
-        os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, 'streams.db')
-CLIP_STORAGE_DIR = os.path.join(DATA_DIR, 'clips')
-try:
-    os.makedirs(CLIP_STORAGE_DIR, exist_ok=True)
-except:
-    CLIP_STORAGE_DIR = '/tmp/clips'
-    os.makedirs(CLIP_STORAGE_DIR, exist_ok=True)
 
-# ============================================
-# DATABASE
-# ============================================
-
+# Initialize SQLite database for persistent storage
 def init_db():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS streams
-                     (match_id TEXT, url TEXT, PRIMARY KEY (match_id, url))''')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Database init error: {e}")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS streams
+                 (match_id TEXT, url TEXT, 
+                  PRIMARY KEY (match_id, url))''')
+    conn.commit()
+    conn.close()
 
 init_db()
 
+# Load m3u8 links from SQLite
 def load_m3u8_links():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT match_id, url FROM streams')
-        rows = c.fetchall()
-        conn.close()
-        links = {}
-        for match_id, url in rows:
-            if match_id not in links:
-                links[match_id] = []
-            links[match_id].append(url)
-        return links
-    except Exception as e:
-        logger.error(f"Error loading m3u8 links: {e}")
-        return {}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT match_id, url FROM streams')
+    rows = c.fetchall()
+    conn.close()
+    
+    links = {}
+    for match_id, url in rows:
+        if match_id not in links:
+            links[match_id] = []
+        links[match_id].append(url)
+    return links
 
+# Save m3u8 links to SQLite
 def save_m3u8_links(links):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('DELETE FROM streams')
-        for match_id, urls in links.items():
-            for url in urls:
-                c.execute('INSERT INTO streams (match_id, url) VALUES (?, ?)', (match_id, url))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Error saving m3u8 links: {e}")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM streams')
+    for match_id, urls in links.items():
+        for url in urls:
+            c.execute('INSERT INTO streams (match_id, url) VALUES (?, ?)', 
+                     (match_id, url))
+    conn.commit()
+    conn.close()
 
-# ============================================
-# CACHE
-# ============================================
+# Competition mapping
+COMPETITIONS = {
+    'WC': {'fd_id': 2000, 'espn': 'fifa.world', 'name': 'FIFA World Cup'},
+    'CL': {'fd_id': 2001, 'espn': 'uefa.champions', 'name': 'Champions League'},
+    'PL': {'fd_id': 2021, 'espn': 'eng.1', 'name': 'Premier League'},
+    'BL1': {'fd_id': 2002, 'espn': 'ger.1', 'name': 'Bundesliga'},
+    'SA': {'fd_id': 2019, 'espn': 'ita.1', 'name': 'Serie A'},
+    'PD': {'fd_id': 2014, 'espn': 'esp.1', 'name': 'La Liga'},
+    'FL1': {'fd_id': 2015, 'espn': 'fra.1', 'name': 'Ligue 1'},
+    'DED': {'fd_id': 2003, 'espn': 'ned.1', 'name': 'Eredivisie'},
+    'ELC': {'fd_id': 2016, 'espn': 'eng.2', 'name': 'Championship'},
+    'CLI': {'fd_id': 2152, 'espn': 'conmebol.libertadores', 'name': 'Copa Libertadores'}
+}
 
-class FastCache:
-    def __init__(self):
-        self._cache = {}
+FOOTBALL_DATA_API_KEY = os.environ.get('FOOTBALL_DATA_API_KEY', '214ac19439794667865a917ad93d187c')
+
+# Simple in-memory cache with TTL
+class SimpleCache:
+    def __init__(self, ttl_seconds=60):  # Reduced to 60 seconds for live updates
+        self.cache = {}
+        self.ttl = ttl_seconds
     
     def get(self, key):
-        if key in self._cache:
-            data, timestamp, ttl = self._cache[key]
-            if time.time() - timestamp < ttl:
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
                 return data
-            del self._cache[key]
+            else:
+                del self.cache[key]
         return None
     
-    def set(self, key, data, ttl):
-        self._cache[key] = (data, time.time(), ttl)
+    def set(self, key, value):
+        self.cache[key] = (value, time.time())
     
     def clear(self):
-        self._cache.clear()
+        self.cache = {}
 
-cache = FastCache()
+# Cache instances with different TTLs
+competition_cache = SimpleCache(ttl_seconds=3600)  # 1 hour for competitions
+matches_cache = SimpleCache(ttl_seconds=30)  # 30 seconds for matches (faster updates)
 
-# ============================================
-# REQUESTS SESSION
-# ============================================
-
-def get_session():
-    session = requests.Session()
-    retry_strategy = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.espn.com/',
-        'X-Auth-Token': FOOTBALL_DATA_API_KEY
-    })
-    return session
-
-session = get_session()
-
-# ============================================
-# CORS HEADERS
-# ============================================
-
-@app.after_request
-def add_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Auth-Token'
-    response.headers['Content-Type'] = 'application/json'
-    return response
-
-# ============================================
-# DATA FETCHING - DAILY FIXTURES (football-data.org)
-# ============================================
-
-def fetch_fd_fixtures(fd_id, date_str):
-    """Fetch fixtures from football-data.org for a specific date."""
+def fetch_competitions():
+    """Fetch competitions from football-data.org with caching."""
+    cache_key = 'competitions'
+    cached = competition_cache.get(cache_key)
+    if cached:
+        return cached
+    
+    url = 'https://api.football-data.org/v4/competitions'
+    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
+    
     try:
-        response = session.get(
-            f'{BACKEND_URL}/competitions/{fd_id}/matches',
-            params={'dateFrom': date_str, 'dateTo': date_str},
-            timeout=10
-        )
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
         
-        fixtures = []
+        competitions = {}
+        for comp in data.get('competitions', []):
+            code = comp.get('code')
+            if code in COMPETITIONS:
+                competitions[code] = {
+                    'name': COMPETITIONS[code]['name'],
+                    'emblem': comp.get('emblem'),
+                    'season': comp.get('currentSeason', {}).get('year'),
+                    'fd_id': COMPETITIONS[code]['fd_id'],
+                    'espn_slug': COMPETITIONS[code]['espn']
+                }
+        
+        competition_cache.set(cache_key, competitions)
+        return competitions
+    except Exception as e:
+        print(f"Error fetching competitions: {e}")
+        return {code: {'name': info['name'], 'emblem': None, 'season': None, 
+                      'fd_id': info['fd_id'], 'espn_slug': info['espn']} 
+                for code, info in COMPETITIONS.items()}
+
+def fetch_espn_matches(slug, date=None):
+    """Fetch matches from ESPN API for a specific date."""
+    url = f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard'
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        matches = []
+        events = data.get('events', [])
+        
+        # Use provided date or today
+        if date:
+            try:
+                target_date = datetime.strptime(date, '%Y-%m-%d').date()
+            except:
+                target_date = datetime.now().date()
+        else:
+            target_date = datetime.now().date()
+        
+        for event in events:
+            # Get the event date
+            date_str = event.get('date')
+            if not date_str:
+                continue
+                
+            try:
+                # Parse the date
+                event_date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date()
+                
+                # Skip if not the target date
+                if event_date != target_date:
+                    continue
+            except:
+                # If we can't parse the date, include it anyway
+                pass
+            
+            status = event.get('status', {})
+            type_val = status.get('type', {})
+            state = type_val.get('state', '')
+            
+            competitions = event.get('competitions', [])
+            if not competitions:
+                continue
+                
+            comp = competitions[0]
+            competitors = comp.get('competitors', [])
+            if len(competitors) < 2:
+                continue
+                
+            home = competitors[0]
+            away = competitors[1]
+            
+            # Determine match status
+            if state == 'in':
+                match_status = 'LIVE'
+            elif state == 'post':
+                match_status = 'FINISHED'
+            else:
+                match_status = 'SCHEDULED'
+            
+            # Get scores
+            home_score = home.get('score')
+            away_score = away.get('score')
+            
+            # Get minute
+            minute = status.get('displayClock')
+            
+            # Get kickoff time
+            kickoff = ''
+            if date_str:
+                try:
+                    dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    kickoff = dt.strftime('%H:%M UTC')
+                except:
+                    kickoff = date_str
+            
+            match_id = event.get('id', '')
+            
+            matches.append({
+                'home_team': home.get('team', {}).get('displayName', 'Home'),
+                'away_team': away.get('team', {}).get('displayName', 'Away'),
+                'home_crest': home.get('team', {}).get('logo'),
+                'away_crest': away.get('team', {}).get('logo'),
+                'home_score': home_score if home_score is not None else '-',
+                'away_score': away_score if away_score is not None else '-',
+                'status': match_status,
+                'minute': minute,
+                'kickoff': kickoff,
+                'match_id': str(match_id) if match_id else f"espn_{event.get('id', '')}"
+            })
+        
+        return matches
+    except Exception as e:
+        print(f"Error fetching ESPN matches for {slug}: {e}")
+        return None
+
+def fetch_fd_matches(fd_id, date=None):
+    """Fetch matches from football-data.org API for a specific date with rate limit handling."""
+    if date:
+        date_str = date
+    else:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    
+    # Check cache first
+    cache_key = f"fd_{fd_id}_{date_str}"
+    cached = matches_cache.get(cache_key)
+    if cached:
+        return cached
+    
+    url = f'https://api.football-data.org/v4/competitions/{fd_id}/matches'
+    params = {'dateFrom': date_str, 'dateTo': date_str}
+    headers = {'X-Auth-Token': FOOTBALL_DATA_API_KEY}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        # Handle rate limiting
+        if response.status_code == 429:
+            print(f"Rate limit hit for FD ID {fd_id}, waiting...")
+            time.sleep(2)  # Wait 2 seconds
+            # Try one more time
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+        else:
+            response.raise_for_status()
+            
+        data = response.json()
+        
+        matches = []
         for match in data.get('matches', []):
             home = match.get('homeTeam', {})
             away = match.get('awayTeam', {})
             
-            utc_date = match.get('utcDate')
+            status = match.get('status', '')
+            if status in ['IN_PLAY', 'PAUSED']:
+                match_status = 'LIVE'
+            elif status == 'FINISHED':
+                match_status = 'FINISHED'
+            else:
+                match_status = 'SCHEDULED'
+            
+            score = match.get('score', {})
+            home_score = score.get('fullTime', {}).get('home')
+            away_score = score.get('fullTime', {}).get('away')
+            
+            if home_score is None:
+                home_score = '-'
+            if away_score is None:
+                away_score = '-'
+            
+            # Get kickoff time
             kickoff = ''
+            utc_date = match.get('utcDate')
             if utc_date:
                 try:
                     dt = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
@@ -231,423 +304,870 @@ def fetch_fd_fixtures(fd_id, date_str):
             
             match_id = match.get('id', '')
             
-            fixtures.append({
-                'match_id': str(match_id),
+            matches.append({
                 'home_team': home.get('name', 'Home'),
                 'away_team': away.get('name', 'Away'),
                 'home_crest': home.get('crest'),
                 'away_crest': away.get('crest'),
-                'kickoff': kickoff,
-                'status': 'SCHEDULED',
-                'home_score': '-',
-                'away_score': '-',
+                'home_score': home_score,
+                'away_score': away_score,
+                'status': match_status,
                 'minute': None,
-                'is_live': False
+                'kickoff': kickoff,
+                'match_id': str(match_id) if match_id else f"fd_{match.get('id', '')}"
             })
         
-        return fixtures
+        # Cache the result
+        matches_cache.set(cache_key, matches)
+        return matches
     except Exception as e:
-        logger.error(f"Error fetching FD fixtures: {e}")
-        return []
+        print(f"Error fetching FD matches for ID {fd_id}: {e}")
+        return None
 
-def fetch_daily_fixtures():
-    """Fetch today's fixtures for all active leagues."""
-    logger.info("Starting daily fixture fetch...")
-    today = datetime.now().strftime('%Y-%m-%d')
+def get_matches_for_competition(code, date=None):
+    """Get matches for a competition from ESPN (primary) or FD (fallback)."""
+    if code not in COMPETITIONS:
+        return None, None
+    
+    comp_info = COMPETITIONS[code]
+    espn_slug = comp_info['espn']
+    fd_id = comp_info['fd_id']
+    
+    # Try ESPN first
+    matches_data = fetch_espn_matches(espn_slug, date)
+    data_source = 'ESPN'
+    
+    # If ESPN returns 0 matches or fails, fallback to FD
+    if matches_data is None or len(matches_data) == 0:
+        matches_data = fetch_fd_matches(fd_id, date)
+        data_source = 'football-data.org'
+    
+    # Load m3u8 links and attach to matches
+    m3u8_links = load_m3u8_links()
+    if matches_data:
+        for match in matches_data:
+            match_id = match.get('match_id', '')
+            # Get the list of streams for this match (default to empty list)
+            match['streams'] = m3u8_links.get(match_id, [])
+    
+    return matches_data, data_source
+
+def get_all_matches(date=None):
+    """Get all matches across all competitions for a given date."""
+    all_matches = {}
+    total_count = 0
     
     for code, comp_info in COMPETITIONS.items():
-        if not active_leagues.get(code, False):
-            continue
-        
-        fixtures = fetch_fd_fixtures(comp_info['fd_id'], today)
-        if fixtures is not None:
-            cache_key = f"fixtures_{code}_{today}"
-            cache.set(cache_key, fixtures, 86400)  # 24 hours
-            logger.info(f"Cached {len(fixtures)} fixtures for {comp_info['name']}")
+        matches_data, _ = get_matches_for_competition(code, date)
+        if matches_data:
+            all_matches[code] = {
+                'competition': comp_info['name'],
+                'competition_code': code,
+                'matches': matches_data,
+                'count': len(matches_data)
+            }
+            total_count += len(matches_data)
     
-    logger.info("Daily fixture fetch complete")
+    return all_matches, total_count
 
-# ============================================
-# DATA FETCHING - LIVE SCORES (ESPN)
-# ============================================
+# HTML Templates
+INDEX_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick Admin</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #1a73e8;
+            margin-bottom: 30px;
+            font-weight: 600;
+            font-size: 2rem;
+        }
+        .today-date {
+            color: #666;
+            margin-bottom: 24px;
+            font-size: 1.1rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            text-decoration: none;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        }
+        .card img {
+            width: 64px;
+            height: 64px;
+            object-fit: contain;
+            margin-bottom: 12px;
+        }
+        .card h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .card .season {
+            color: #777;
+            font-size: 0.9rem;
+        }
+        .api-info {
+            margin-top: 40px;
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+        .api-info h3 {
+            color: #1a73e8;
+            margin-bottom: 12px;
+        }
+        .api-info code {
+            background: #f5f7fa;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
+        .api-info .endpoint {
+            margin: 8px 0;
+            padding: 8px 12px;
+            background: #f5f7fa;
+            border-radius: 6px;
+            font-family: monospace;
+        }
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏆 LiveKick Admin</h1>
+        <div class="today-date">📅 {{ today.strftime('%A, %B %d, %Y') }}</div>
+        <div class="grid">
+            {% for code, comp in competitions.items() %}
+            <a href="{{ url_for('matches_web', code=code) }}" class="card">
+                {% if comp.emblem %}
+                <img src="{{ comp.emblem }}" alt="{{ comp.name }}">
+                {% else %}
+                <div style="width:64px;height:64px;background:#e8eaed;border-radius:50%;margin-bottom:12px;"></div>
+                {% endif %}
+                <h3>{{ comp.name }}</h3>
+                <div class="season">{{ comp.season or 'Current Season' }}</div>
+            </a>
+            {% endfor %}
+        </div>
+        
+        <div class="api-info">
+            <h3>📱 API Endpoints for LiveKick App</h3>
+            <div class="endpoint">GET /api/competitions - List all competitions</div>
+            <div class="endpoint">GET /api/matches - Get ALL matches for today</div>
+            <div class="endpoint">GET /api/matches?code=PL - Get matches for a competition</div>
+            <div class="endpoint">GET /api/matches/live - Get all live matches</div>
+            <div class="endpoint">GET /api/matches/&lt;match_id&gt; - Get a specific match by ID</div>
+            <div class="endpoint">GET /api/m3u8/&lt;match_id&gt; - Get all m3u8 links for a match</div>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
-def fetch_espn_live_matches(slug):
-    """Fetch ONLY currently LIVE matches from ESPN."""
-    try:
-        response = session.get(
-            f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard',
-            timeout=5
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        live_matches = []
-        
-        for event in data.get('events', []):
-            status = event.get('status', {})
-            state = status.get('type', {}).get('state', '')
+MATCHES_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveKick Admin - {{ competition.name }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+        .header h1 {
+            color: #1a73e8;
+            font-weight: 600;
+            font-size: 1.8rem;
+        }
+        .sub-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .back-btn {
+            display: inline-block;
+            padding: 8px 16px;
+            background: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        .back-btn:hover {
+            background: #1557b0;
+        }
+        .today-date {
+            color: #666;
+            font-size: 0.95rem;
+        }
+        .match-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .match-item {
+            background: white;
+            border-radius: 12px;
+            padding: 16px 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .match-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .match-teams {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex: 1;
+            min-width: 200px;
+        }
+        .match-teams img {
+            width: 32px;
+            height: 32px;
+            object-fit: contain;
+        }
+        .team-name {
+            font-weight: 500;
+        }
+        .match-info {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        .badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-live {
+            background: #ff1744;
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .badge-ft {
+            background: #e8eaed;
+            color: #555;
+        }
+        .score {
+            font-weight: 700;
+            font-size: 1.1rem;
+            min-width: 60px;
+            text-align: center;
+        }
+        .time {
+            color: #666;
+            font-size: 0.9rem;
+            min-width: 80px;
+        }
+        .minute {
+            color: #1a73e8;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        .source-badge {
+            font-size: 0.7rem;
+            color: #999;
+            margin-top: 8px;
+            text-align: center;
+        }
+        .no-matches {
+            text-align: center;
+            padding: 60px 20px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+        .no-matches .emoji {
+            font-size: 4rem;
+            margin-bottom: 16px;
+        }
+        .no-matches p {
+            color: #777;
+            font-size: 1.2rem;
+        }
+        .no-matches .date {
+            color: #999;
+            font-size: 1rem;
+            margin-top: 8px;
+        }
+        .m3u8-section {
+            margin-top: 8px;
+            padding-top: 12px;
+            border-top: 1px solid #e8eaed;
+        }
+        .m3u8-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+        .m3u8-header label {
+            font-size: 0.85rem;
+            color: #666;
+            font-weight: 600;
+        }
+        .m3u8-input-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .m3u8-input-row input {
+            flex: 1;
+            min-width: 200px;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        .m3u8-input-row input:focus {
+            outline: none;
+            border-color: #1a73e8;
+            box-shadow: 0 0 0 2px rgba(26,115,232,0.1);
+        }
+        .m3u8-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .m3u8-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 6px 12px;
+            background: #f5f7fa;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            word-break: break-all;
+        }
+        .m3u8-item .url {
+            flex: 1;
+            min-width: 150px;
+        }
+        .m3u8-item .remove-btn {
+            background: none;
+            border: none;
+            color: #ff1744;
+            cursor: pointer;
+            font-size: 1.2rem;
+            padding: 0 4px;
+        }
+        .m3u8-item .remove-btn:hover {
+            color: #d50000;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-weight: 500;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        .btn-primary {
+            background: #1a73e8;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #1557b0;
+        }
+        .btn-danger {
+            background: #ff1744;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #d50000;
+        }
+        .btn-success {
+            background: #00c853;
+            color: white;
+        }
+        .btn-success:hover {
+            background: #009624;
+        }
+        .btn-sm {
+            padding: 4px 12px;
+            font-size: 0.75rem;
+        }
+        .stream-count {
+            font-size: 0.8rem;
+            color: #1a73e8;
+            font-weight: 600;
+        }
+        .no-streams {
+            color: #999;
+            font-size: 0.85rem;
+            font-style: italic;
+        }
+        @media (max-width: 768px) {
+            .match-row {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .match-teams {
+                justify-content: center;
+            }
+            .match-info {
+                justify-content: center;
+            }
+            .m3u8-input-row {
+                flex-direction: column;
+            }
+            .m3u8-input-row input {
+                width: 100%;
+            }
+            .m3u8-item {
+                flex-wrap: wrap;
+            }
+        }
+    </style>
+    <script>
+        function addStream(matchId) {
+            const input = document.getElementById('input-' + matchId);
+            const url = input.value.trim();
+            if (!url) {
+                alert('Please enter a valid stream URL');
+                return;
+            }
             
-            # ONLY process currently LIVE matches
-            if state != 'in':
-                continue
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                alert('URL must start with http:// or https://');
+                return;
+            }
             
-            competitions = event.get('competitions', [])
-            if not competitions:
-                continue
-            
-            comp = competitions[0]
-            competitors = comp.get('competitors', [])
-            if len(competitors) < 2:
-                continue
-            
-            home = competitors[0]
-            away = competitors[1]
-            
-            live_matches.append({
-                'match_id': str(event.get('id', '')),
-                'home_team': home.get('team', {}).get('displayName', 'Home'),
-                'away_team': away.get('team', {}).get('displayName', 'Away'),
-                'home_crest': home.get('team', {}).get('logo'),
-                'away_crest': away.get('team', {}).get('logo'),
-                'home_score': home.get('score', '0'),
-                'away_score': away.get('score', '0'),
-                'minute': status.get('displayClock', '0'),
-                'status': 'LIVE',
-                'is_live': True,
-                'kickoff': None
+            fetch('/api/m3u8/' + matchId, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ url: url })
             })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error adding stream');
+                console.error('Error:', error);
+            });
+        }
         
-        return live_matches
+        function removeStream(matchId, url) {
+            if (!confirm('Remove this stream link?')) {
+                return;
+            }
+            
+            fetch('/api/m3u8/' + matchId, {
+                method: 'DELETE',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ url: url })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error removing stream');
+                console.error('Error:', error);
+            });
+        }
+        
+        function clearAllStreams(matchId) {
+            if (!confirm('Remove ALL stream links for this match?')) {
+                return;
+            }
+            
+            fetch('/api/m3u8/' + matchId + '/clear', {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error clearing streams');
+                console.error('Error:', error);
+            });
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="{{ url_for('index') }}" class="back-btn">← Back</a>
+            <h1>🏆 {{ competition.name }}</h1>
+        </div>
+        <div class="sub-header">
+            <div class="today-date">📅 {{ today.strftime('%A, %B %d, %Y') }}</div>
+        </div>
+        
+        {% if matches %}
+        <div class="match-list">
+            {% for match in matches %}
+            <div class="match-item">
+                <div class="match-row">
+                    <div class="match-teams">
+                        {% if match.home_crest %}
+                        <img src="{{ match.home_crest }}" alt="{{ match.home_team }}">
+                        {% endif %}
+                        <span class="team-name">{{ match.home_team }}</span>
+                        <span style="color:#999;">vs</span>
+                        <span class="team-name">{{ match.away_team }}</span>
+                        {% if match.away_crest %}
+                        <img src="{{ match.away_crest }}" alt="{{ match.away_team }}">
+                        {% endif %}
+                    </div>
+                    <div class="match-info">
+                        {% if match.status == 'LIVE' %}
+                            <span class="badge badge-live">LIVE</span>
+                            <span class="score">{{ match.home_score }} - {{ match.away_score }}</span>
+                            {% if match.minute %}
+                            <span class="minute">{{ match.minute }}'</span>
+                            {% endif %}
+                        {% elif match.status == 'FINISHED' %}
+                            <span class="badge badge-ft">FT</span>
+                            <span class="score">{{ match.home_score }} - {{ match.away_score }}</span>
+                        {% else %}
+                            <span class="time">{{ match.kickoff }}</span>
+                        {% endif %}
+                    </div>
+                </div>
+                
+                <!-- M3U8 Management Section -->
+                <div class="m3u8-section">
+                    <div class="m3u8-header">
+                        <label>📺 Streams:</label>
+                        {% if match.streams %}
+                            <span class="stream-count">{{ match.streams|length }} streams available</span>
+                            <button class="btn btn-danger btn-sm" onclick="clearAllStreams('{{ match.match_id }}')">Clear All</button>
+                        {% else %}
+                            <span class="no-streams">No streams added</span>
+                        {% endif %}
+                    </div>
+                    
+                    {% if match.streams %}
+                    <div class="m3u8-list">
+                        {% for stream in match.streams %}
+                        <div class="m3u8-item">
+                            <span class="url">{{ stream }}</span>
+                            <button class="remove-btn" onclick="removeStream('{{ match.match_id }}', '{{ stream }}')" title="Remove this stream">✕</button>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                    
+                    <div class="m3u8-input-row">
+                        <input id="input-{{ match.match_id }}" type="text" placeholder="Paste stream URL here..." />
+                        <button class="btn btn-primary" onclick="addStream('{{ match.match_id }}')">Add Stream</button>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        <div class="source-badge">Data source: {{ data_source }}</div>
+        {% else %}
+        <div class="no-matches">
+            <div class="emoji">📅</div>
+            <p>No matches scheduled for today</p>
+            <div class="date">{{ today.strftime('%A, %B %d, %Y') }}</div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+'''
+
+# =============================================
+# WEB ROUTES (Admin Panel)
+# =============================================
+
+@app.route('/')
+def index():
+    competitions = fetch_competitions()
+    today = datetime.now()
+    return render_template_string(INDEX_TEMPLATE, competitions=competitions, today=today)
+
+@app.route('/matches/<code>')
+def matches_web(code):
+    if code not in COMPETITIONS:
+        return "Competition not found", 404
+    
+    comp_info = COMPETITIONS[code]
+    comp_name = comp_info['name']
+    
+    matches_data, data_source = get_matches_for_competition(code)
+    
+    competitions = fetch_competitions()
+    comp_display = competitions.get(code, {'name': comp_name, 'emblem': None, 'season': None})
+    
+    today = datetime.now()
+    
+    return render_template_string(
+        MATCHES_TEMPLATE, 
+        matches=matches_data or [], 
+        competition=comp_display,
+        data_source=data_source,
+        today=today
+    )
+
+# =============================================
+# API ROUTES FOR ANDROID APP
+# =============================================
+
+@app.route('/api/competitions', methods=['GET'])
+def api_competitions():
+    """API endpoint to get all competitions."""
+    try:
+        competitions = fetch_competitions()
+        result = []
+        for code, comp in competitions.items():
+            result.append({
+                'code': code,
+                'name': comp['name'],
+                'emblem': comp.get('emblem', ''),
+                'season': comp.get('season', 'Current Season'),
+                'enabled': True
+            })
+        return jsonify({
+            'success': True,
+            'data': result,
+            'count': len(result)
+        })
     except Exception as e:
-        logger.error(f"Error fetching ESPN live matches: {e}")
-        return []
-
-# ============================================
-# SMART DATA FETCHING
-# ============================================
-
-def get_matches_for_today(code):
-    """
-    Get matches for today - combines fixtures + live updates.
-    Only LIVE matches have scores/minutes.
-    """
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    # Get fixtures from cache (daily)
-    fixtures_key = f"fixtures_{code}_{today}"
-    fixtures = cache.get(fixtures_key)
-    
-    # If fixtures not in cache, fetch them
-    if fixtures is None:
-        comp_info = COMPETITIONS.get(code)
-        if comp_info:
-            fixtures = fetch_fd_fixtures(comp_info['fd_id'], today)
-            if fixtures is not None and len(fixtures) > 0:
-                cache.set(fixtures_key, fixtures, 86400)
-        else:
-            fixtures = []
-    
-    # Get live matches from ESPN
-    comp_info = COMPETITIONS.get(code)
-    live_matches = []
-    if comp_info:
-        live_matches = fetch_espn_live_matches(comp_info['espn'])
-    
-    # Update fixtures with live data
-    if fixtures and live_matches:
-        # Create lookup for live matches
-        live_lookup = {m['match_id']: m for m in live_matches}
-        
-        for fixture in fixtures:
-            match_id = fixture['match_id']
-            if match_id in live_lookup:
-                # Update with live data
-                live = live_lookup[match_id]
-                fixture['status'] = 'LIVE'
-                fixture['home_score'] = live['home_score']
-                fixture['away_score'] = live['away_score']
-                fixture['minute'] = live['minute']
-                fixture['is_live'] = True
-            else:
-                # Not live, keep as scheduled
-                fixture['status'] = 'SCHEDULED'
-                fixture['is_live'] = False
-    
-    return fixtures or []
-
-def get_all_today_matches():
-    """Get all matches for today across all active leagues."""
-    all_matches = []
-    
-    for code in COMPETITIONS.keys():
-        if not active_leagues.get(code, False):
-            continue
-        
-        matches = get_matches_for_today(code)
-        
-        # Add competition info to each match
-        comp_info = COMPETITIONS.get(code)
-        for match in matches:
-            match['competition_code'] = code
-            match['competition_name'] = comp_info['name'] if comp_info else code
-        
-        all_matches.extend(matches)
-    
-    return all_matches
-
-# ============================================
-# BACKGROUND UPDATES
-# ============================================
-
-def background_live_updater():
-    """Background thread to keep live matches updated."""
-    while True:
-        try:
-            # Just cache the live matches for quick access
-            live_matches = []
-            for code in COMPETITIONS.keys():
-                if not active_leagues.get(code, False):
-                    continue
-                comp_info = COMPETITIONS.get(code)
-                if comp_info:
-                    live = fetch_espn_live_matches(comp_info['espn'])
-                    for match in live:
-                        match['competition_code'] = code
-                        match['competition_name'] = comp_info['name']
-                    live_matches.extend(live)
-            
-            # Cache live matches with short TTL
-            cache.set('live_matches_cached', live_matches, 15)  # 15 seconds
-            logger.info(f"Updated {len(live_matches)} live matches")
-            
-            time.sleep(15)
-        except Exception as e:
-            logger.error(f"Background updater error: {e}")
-            time.sleep(15)
-
-def start_background_updater():
-    thread = threading.Thread(target=background_live_updater, daemon=True)
-    thread.start()
-    logger.info("Background live updater started")
-
-# ============================================
-# SCHEDULED DAILY FIXTURE FETCH
-# ============================================
-
-def schedule_daily_fetch():
-    """Schedule daily fixture fetch at 1 AM EAT."""
-    def scheduler():
-        while True:
-            try:
-                now = datetime.now()
-                # 1 AM EAT = 10 PM UTC (22:00)
-                target_hour = 22
-                target_minute = 0
-                
-                next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-                if now > next_run:
-                    next_run += timedelta(days=1)
-                
-                wait_seconds = (next_run - now).total_seconds()
-                logger.info(f"Next fixture fetch at {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                time.sleep(wait_seconds)
-                fetch_daily_fixtures()
-            except Exception as e:
-                logger.error(f"Scheduler error: {e}")
-                time.sleep(60)
-    
-    thread = threading.Thread(target=scheduler, daemon=True)
-    thread.start()
-    logger.info("Daily fixture scheduler started")
-
-# ============================================
-# API ENDPOINTS
-# ============================================
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/matches', methods=['GET'])
-def api_matches():
-    """Get all matches for today (scheduled + live)."""
+def api_matches_handler():
+    """Handle all /api/matches requests from Android app."""
     try:
-        today = datetime.now().strftime('%Y-%m-%d')
-        force_refresh = request.args.get('refresh') == 'true'
+        status = request.args.get('status')
+        code = request.args.get('code')
+        date = request.args.get('date')
+        match_id = request.args.get('match_id')
         
-        cache_key = f"all_matches_{today}"
+        # If match_id is provided, return specific match
+        if match_id:
+            return api_match_by_id(match_id)
         
-        if not force_refresh:
-            cached = cache.get(cache_key)
-            if cached:
+        # If status=live, return live matches
+        if status == 'live':
+            return api_matches_live()
+        
+        # If code is provided, return matches for that competition
+        if code:
+            code = code.upper()
+            if code not in COMPETITIONS:
+                return jsonify({
+                    'success': False,
+                    'error': 'Competition not found'
+                }), 404
+            
+            matches_data, data_source = get_matches_for_competition(code, date)
+            
+            if matches_data is None:
                 return jsonify({
                     'success': True,
                     'data': {
-                        'date': today,
-                        'matches': cached
+                        'competition': {
+                            'code': code,
+                            'name': COMPETITIONS[code]['name']
+                        },
+                        'date': date or datetime.now().strftime('%Y-%m-%d'),
+                        'source': data_source,
+                        'matches': [],
+                        'count': 0
                     }
                 })
+            
+            comp_info = COMPETITIONS[code]
+            
+            return jsonify({
+                'success': True,
+                'data': {
+                    'competition': {
+                        'code': code,
+                        'name': comp_info['name'],
+                        'fd_id': comp_info['fd_id'],
+                        'espn_slug': comp_info['espn']
+                    },
+                    'date': date or datetime.now().strftime('%Y-%m-%d'),
+                    'source': data_source,
+                    'matches': matches_data,
+                    'count': len(matches_data)
+                }
+            })
         
-        matches = get_all_today_matches()
-        
-        # Cache for 1 minute
-        cache.set(cache_key, matches, 60)
+        # Default: return ALL matches for today
+        all_matches, total_count = get_all_matches(date)
         
         return jsonify({
             'success': True,
             'data': {
-                'date': today,
-                'matches': matches
+                'matches': all_matches,
+                'total_count': total_count,
+                'date': date or datetime.now().strftime('%Y-%m-%d')
             }
         })
     except Exception as e:
-        logger.error(f"Error in api_matches: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
 @app.route('/api/matches/live', methods=['GET'])
-def api_live_matches():
-    """Get only currently live matches."""
+def api_matches_live():
+    """API endpoint to get all currently live matches."""
     try:
-        # Get from cache (updated every 15 seconds)
-        live = cache.get('live_matches_cached')
+        live_matches = []
         
-        if live is None:
-            # Fetch fresh if cache is empty
-            live = []
-            for code in COMPETITIONS.keys():
-                if not active_leagues.get(code, False):
-                    continue
-                comp_info = COMPETITIONS.get(code)
-                if comp_info:
-                    matches = fetch_espn_live_matches(comp_info['espn'])
-                    for match in matches:
+        for code, comp_info in COMPETITIONS.items():
+            matches_data, _ = get_matches_for_competition(code)
+            
+            if matches_data:
+                for match in matches_data:
+                    if match.get('status') == 'LIVE':
                         match['competition_code'] = code
                         match['competition_name'] = comp_info['name']
-                    live.extend(matches)
+                        live_matches.append(match)
         
         return jsonify({
             'success': True,
             'data': {
-                'count': len(live),
-                'matches': live
+                'count': len(live_matches),
+                'matches': live_matches
             }
         })
     except Exception as e:
-        logger.error(f"Error in api_live_matches: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
-@app.route('/api/matches/<code>', methods=['GET'])
-def api_matches_by_league(code):
-    """Get matches for a specific league today."""
+@app.route('/api/matches/<match_id>', methods=['GET'])
+def api_match_by_id(match_id):
+    """API endpoint to get a specific match by its ID."""
     try:
-        if code not in COMPETITIONS:
-            return jsonify({'success': False, 'error': 'League not found or inactive'}), 404
+        # Search for the match across all competitions
+        for code, comp_info in COMPETITIONS.items():
+            matches_data, _ = get_matches_for_competition(code)
+            if matches_data:
+                for match in matches_data:
+                    if match.get('match_id') == match_id:
+                        match['competition_code'] = code
+                        match['competition_name'] = comp_info['name']
+                        return jsonify({
+                            'success': True,
+                            'data': match
+                        })
         
-        if not active_leagues.get(code, False):
-            return jsonify({'success': False, 'error': 'League is inactive'}), 404
-        
-        matches = get_matches_for_today(code)
-        comp_info = COMPETITIONS.get(code)
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'competition': {
-                    'code': code,
-                    'name': comp_info['name'] if comp_info else code,
-                    'fd_id': comp_info['fd_id'] if comp_info else None,
-                    'espn_slug': comp_info['espn'] if comp_info else None
-                },
-                'matches': matches
-            }
-        })
-    except Exception as e:
-        logger.error(f"Error in api_matches_by_league: {e}")
         return jsonify({
             'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/competitions', methods=['GET'])
-def api_competitions():
-    """Get all active competitions."""
-    try:
-        competitions = []
-        for code, info in COMPETITIONS.items():
-            if active_leagues.get(code, False):
-                competitions.append({
-                    'code': code,
-                    'name': info['name'],
-                    'fd_id': info['fd_id'],
-                    'espn_slug': info['espn']
-                })
-        return jsonify({'success': True, 'data': competitions})
+            'error': 'Match not found'
+        }), 404
     except Exception as e:
-        logger.error(f"Error in api_competitions: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/leagues', methods=['GET'])
-def api_leagues():
-    """Get all leagues with their active status."""
-    try:
-        leagues = []
-        for code, info in ALL_LEAGUES.items():
-            leagues.append({
-                'code': code,
-                'name': info['name'],
-                'active': active_leagues.get(code, False),
-                'default': info['default']
-            })
-        return jsonify({'success': True, 'data': leagues})
-    except Exception as e:
-        logger.error(f"Error in api_leagues: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/leagues', methods=['POST'])
-def api_update_leagues():
-    """Update active leagues."""
-    try:
-        data = request.get_json()
-        if not data or 'leagues' not in data:
-            return jsonify({'success': False, 'error': 'Missing leagues data'}), 400
-        
-        new_active = data['leagues']
-        
-        # Validate
-        for code in new_active.keys():
-            if code not in ALL_LEAGUES:
-                return jsonify({'success': False, 'error': f'Invalid league: {code}'}), 400
-        
-        # Save
-        global active_leagues, COMPETITIONS
-        active_leagues = new_active
-        save_active_leagues(active_leagues)
-        COMPETITIONS = get_active_competitions()
-        
-        # Clear cache to force refresh
-        cache.clear()
-        
-        logger.info(f"Updated active leagues: {[k for k, v in active_leagues.items() if v]}")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Leagues updated successfully',
-            'data': {
-                'active': [k for k, v in active_leagues.items() if v],
-                'inactive': [k for k, v in active_leagues.items() if not v]
-            }
-        })
-    except Exception as e:
-        logger.error(f"Error in api_update_leagues: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -655,11 +1175,12 @@ def api_update_leagues():
 
 @app.route('/api/m3u8/<match_id>', methods=['GET', 'POST', 'DELETE'])
 def api_m3u8(match_id):
-    """Manage m3u8 links for a match."""
+    """API endpoint to manage m3u8 links for a match."""
     try:
         m3u8_links = load_m3u8_links()
         
         if request.method == 'GET':
+            """Get all m3u8 links for a match."""
             streams = m3u8_links.get(match_id, [])
             return jsonify({
                 'success': True,
@@ -671,17 +1192,34 @@ def api_m3u8(match_id):
             })
         
         elif request.method == 'POST':
+            """Add a new m3u8 link for a match."""
             data = request.get_json()
             if not data or 'url' not in data:
-                return jsonify({'success': False, 'error': 'Missing url'}), 400
+                return jsonify({
+                    'success': False,
+                    'error': 'Missing url parameter'
+                }), 400
             
             url = data['url'].strip()
-            if not url or not url.startswith(('http://', 'https://')):
-                return jsonify({'success': False, 'error': 'Invalid URL'}), 400
+            if not url:
+                return jsonify({
+                    'success': False,
+                    'error': 'URL cannot be empty'
+                }), 400
+            
+            if not url.startswith(('http://', 'https://')):
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid URL format. Must start with http:// or https://'
+                }), 400
             
             streams = m3u8_links.get(match_id, [])
+            
             if url in streams:
-                return jsonify({'success': False, 'error': 'Stream already exists'}), 400
+                return jsonify({
+                    'success': False,
+                    'error': 'This stream URL already exists for this match'
+                }), 400
             
             streams.append(url)
             m3u8_links[match_id] = streams
@@ -689,22 +1227,34 @@ def api_m3u8(match_id):
             
             return jsonify({
                 'success': True,
-                'message': 'Stream added',
-                'data': {'match_id': match_id, 'streams': streams, 'count': len(streams)}
+                'message': 'Stream added successfully',
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
             })
         
         elif request.method == 'DELETE':
+            """Remove a specific m3u8 link for a match."""
             data = request.get_json()
             if not data or 'url' not in data:
-                return jsonify({'success': False, 'error': 'Missing url'}), 400
+                return jsonify({
+                    'success': False,
+                    'error': 'Missing url parameter'
+                }), 400
             
             url = data['url'].strip()
             streams = m3u8_links.get(match_id, [])
             
             if url not in streams:
-                return jsonify({'success': False, 'error': 'Stream not found'}), 404
+                return jsonify({
+                    'success': False,
+                    'error': 'Stream URL not found for this match'
+                }), 404
             
             streams.remove(url)
+            
             if streams:
                 m3u8_links[match_id] = streams
             else:
@@ -712,65 +1262,73 @@ def api_m3u8(match_id):
             
             save_m3u8_links(m3u8_links)
             
-            return jsonify({'success': True, 'message': 'Stream removed'})
+            return jsonify({
+                'success': True,
+                'message': 'Stream removed successfully',
+                'data': {
+                    'match_id': match_id,
+                    'streams': streams,
+                    'count': len(streams)
+                }
+            })
     except Exception as e:
-        logger.error(f"Error in api_m3u8: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
-@app.route('/health')
-def health():
+@app.route('/api/m3u8/<match_id>/clear', methods=['DELETE'])
+def api_m3u8_clear(match_id):
+    """Clear all m3u8 links for a match."""
     try:
-        return jsonify({
-            'status': 'healthy',
-            'timestamp': datetime.now().isoformat(),
-            'port': PORT,
-            'active_leagues': [k for k, v in active_leagues.items() if v],
-            'cache_size': len(cache._cache)
-        })
+        m3u8_links = load_m3u8_links()
+        
+        if match_id in m3u8_links:
+            del m3u8_links[match_id]
+            save_m3u8_links(m3u8_links)
+            return jsonify({
+                'success': True,
+                'message': 'All streams cleared successfully'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'No streams found for this match'
+            }), 404
     except Exception as e:
         return jsonify({
-            'status': 'unhealthy',
+            'success': False,
             'error': str(e)
         }), 500
 
-# ============================================
-# WEB ROUTES (Admin Panel)
-# ============================================
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint for Render."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0',
+        'competitions': len(COMPETITIONS)
+    })
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/admin/leagues')
-def admin_leagues():
-    return render_template('leagues.html')
-
-@app.route('/admin/matches')
-def admin_matches():
-    return render_template('matches.html')
-
-# ============================================
+# =============================================
 # ERROR HANDLERS
-# ============================================
+# =============================================
 
-# ============================================
-# START APP
-# ============================================
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
 
 if __name__ == '__main__':
-    try:
-        # Start background services
-        start_background_updater()
-        schedule_daily_fetch()
-        
-        # Initial fetch
-        fetch_daily_fixtures()
-    except Exception as e:
-        logger.error(f"Error starting services: {e}")
-    
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Starting server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=DEBUG)
+    app.run(host='0.0.0.0', port=port, debug=False)
